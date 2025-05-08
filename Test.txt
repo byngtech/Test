@@ -1,0 +1,196 @@
+<svg viewBox="0 0 800 1200" xmlns="http://www.w3.org/2000/svg">
+  <!-- Title -->
+  <text x="400" y="40" font-family="Arial" font-size="24" font-weight="bold" text-anchor="middle">Kubernetes Deployment Strategies</text>
+  
+  <!-- ROLLOUT DEPLOYMENT -->
+  <rect x="50" y="70" width="700" height="250" fill="#f8f9fa" stroke="#ddd" stroke-width="2" rx="10" />
+  <text x="400" y="100" font-family="Arial" font-size="20" font-weight="bold" text-anchor="middle">Standard Rollout (Rolling Update)</text>
+  
+  <!-- Initial state -->
+  <rect x="100" y="130" width="600" height="50" fill="#e9ecef" stroke="#adb5bd" stroke-width="1" rx="5" />
+  <text x="400" y="160" font-family="Arial" font-size="14" text-anchor="middle">Initial State: 3 Pods of v1</text>
+  <circle cx="200" cy="155" r="15" fill="#3b82f6" />
+  <text x="200" cy="160" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  <circle cx="350" cy="155" r="15" fill="#3b82f6" />
+  <text x="350" cy="160" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  <circle cx="500" cy="155" r="15" fill="#3b82f6" />
+  <text x="500" cy="160" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  
+  <!-- Step 1 -->
+  <rect x="100" y="190" width="600" height="50" fill="#e9ecef" stroke="#adb5bd" stroke-width="1" rx="5" />
+  <text x="400" y="220" font-family="Arial" font-size="14" text-anchor="middle">Step 1: Create new v2 pod, remove one v1 pod</text>
+  <circle cx="200" cy="215" r="15" fill="#3b82f6" />
+  <text x="200" cy="220" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  <circle cx="350" cy="215" r="15" fill="#3b82f6" />
+  <text x="350" cy="220" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  <circle cx="500" cy="215" r="15" fill="#10b981" />
+  <text x="500" cy="220" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v2</text>
+  
+  <!-- Step 2 -->
+  <rect x="100" y="250" width="600" height="50" fill="#e9ecef" stroke="#adb5bd" stroke-width="1" rx="5" />
+  <text x="400" y="280" font-family="Arial" font-size="14" text-anchor="middle">Final State: All pods updated to v2</text>
+  <circle cx="200" cy="275" r="15" fill="#10b981" />
+  <text x="200" cy="280" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v2</text>
+  <circle cx="350" cy="275" r="15" fill="#10b981" />
+  <text x="350" cy="280" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v2</text>
+  <circle cx="500" cy="275" r="15" fill="#10b981" />
+  <text x="500" cy="280" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v2</text>
+  
+  <!-- BLUE-GREEN DEPLOYMENT -->
+  <rect x="50" y="340" width="700" height="280" fill="#f8f9fa" stroke="#ddd" stroke-width="2" rx="10" />
+  <text x="400" y="370" font-family="Arial" font-size="20" font-weight="bold" text-anchor="middle">Blue-Green Deployment</text>
+  
+  <!-- Initial state -->
+  <rect x="100" y="400" width="600" height="50" fill="#e9ecef" stroke="#adb5bd" stroke-width="1" rx="5" />
+  <text x="400" y="430" font-family="Arial" font-size="14" text-anchor="middle">Initial State: Production traffic to Blue (v1)</text>
+  <circle cx="200" cy="425" r="15" fill="#3b82f6" />
+  <text x="200" cy="430" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  <circle cx="350" cy="425" r="15" fill="#3b82f6" />
+  <text x="350" cy="430" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  <circle cx="500" cy="425" r="15" fill="#3b82f6" />
+  <text x="500" cy="430" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  
+  <polygon points="100,425 70,425 80,435 70,445 100,445" fill="#6c757d" />
+  <text x="60" y="430" font-family="Arial" font-size="12" fill="black" text-anchor="middle">Traffic</text>
+  
+  <!-- Step 1 -->
+  <rect x="100" y="460" width="600" height="50" fill="#e9ecef" stroke="#adb5bd" stroke-width="1" rx="5" />
+  <text x="400" y="490" font-family="Arial" font-size="14" text-anchor="middle">Step 1: Deploy Green (v2) alongside Blue (v1)</text>
+  <circle cx="200" cy="485" r="15" fill="#3b82f6" />
+  <text x="200" cy="490" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  <circle cx="350" cy="485" r="15" fill="#3b82f6" />
+  <text x="350" cy="490" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  <circle cx="500" cy="485" r="15" fill="#3b82f6" />
+  <text x="500" cy="490" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  
+  <polygon points="100,485 70,485 80,495 70,505 100,505" fill="#6c757d" />
+  <text x="60" y="490" font-family="Arial" font-size="12" fill="black" text-anchor="middle">Traffic</text>
+  
+  <circle cx="200" cy="525" r="15" fill="#10b981" />
+  <text x="200" cy="530" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v2</text>
+  <circle cx="350" cy="525" r="15" fill="#10b981" />
+  <text x="350" cy="530" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v2</text>
+  <circle cx="500" cy="525" r="15" fill="#10b981" />
+  <text x="500" cy="530" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v2</text>
+  
+  <!-- Step 2 -->
+  <rect x="100" y="550" width="600" height="50" fill="#e9ecef" stroke="#adb5bd" stroke-width="1" rx="5" />
+  <text x="400" y="580" font-family="Arial" font-size="14" text-anchor="middle">Final State: Switch traffic to Green (v2), can remove Blue (v1)</text>
+  <circle cx="200" cy="570" r="15" fill="#3b82f6" opacity="0.4" />
+  <text x="200" cy="575" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  <circle cx="350" cy="570" r="15" fill="#3b82f6" opacity="0.4" />
+  <text x="350" cy="575" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  <circle cx="500" cy="570" r="15" fill="#3b82f6" opacity="0.4" />
+  <text x="500" cy="575" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  
+  <circle cx="200" cy="610" r="15" fill="#10b981" />
+  <text x="200" cy="615" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v2</text>
+  <circle cx="350" cy="610" r="15" fill="#10b981" />
+  <text x="350" cy="615" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v2</text>
+  <circle cx="500" cy="610" r="15" fill="#10b981" />
+  <text x="500" cy="615" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v2</text>
+  
+  <polygon points="100,610 70,610 80,620 70,630 100,630" fill="#6c757d" />
+  <text x="60" y="615" font-family="Arial" font-size="12" fill="black" text-anchor="middle">Traffic</text>
+  
+  <!-- CANARY DEPLOYMENT -->
+  <rect x="50" y="640" width="700" height="350" fill="#f8f9fa" stroke="#ddd" stroke-width="2" rx="10" />
+  <text x="400" y="670" font-family="Arial" font-size="20" font-weight="bold" text-anchor="middle">Canary Deployment</text>
+  
+  <!-- Initial state -->
+  <rect x="100" y="700" width="600" height="50" fill="#e9ecef" stroke="#adb5bd" stroke-width="1" rx="5" />
+  <text x="400" y="730" font-family="Arial" font-size="14" text-anchor="middle">Initial State: 100% traffic to v1</text>
+  <circle cx="200" cy="725" r="15" fill="#3b82f6" />
+  <text x="200" cy="730" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  <circle cx="350" cy="725" r="15" fill="#3b82f6" />
+  <text x="350" cy="730" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  <circle cx="500" cy="725" r="15" fill="#3b82f6" />
+  <text x="500" cy="730" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  
+  <polygon points="100,725 70,725 80,735 70,745 100,745" fill="#6c757d" />
+  <text x="60" y="730" font-family="Arial" font-size="12" fill="black" text-anchor="middle">Traffic</text>
+  
+  <!-- Step 1 -->
+  <rect x="100" y="760" width="600" height="50" fill="#e9ecef" stroke="#adb5bd" stroke-width="1" rx="5" />
+  <text x="400" y="790" font-family="Arial" font-size="14" text-anchor="middle">Step 1: Deploy single v2 pod, route small % of traffic (e.g., 10%)</text>
+  <circle cx="200" cy="785" r="15" fill="#3b82f6" />
+  <text x="200" cy="790" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  <circle cx="350" cy="785" r="15" fill="#3b82f6" />
+  <text x="350" cy="790" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  <circle cx="500" cy="785" r="15" fill="#3b82f6" />
+  <text x="500" cy="790" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  <circle cx="650" cy="785" r="15" fill="#10b981" />
+  <text x="650" cy="790" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v2</text>
+  
+  <line x1="80" y1="785" x2="175" y2="785" stroke="#6c757d" stroke-width="2" />
+  <polygon points="175,785 170,780 170,790" fill="#6c757d" />
+  <text x="130" y="780" font-family="Arial" font-size="12" fill="black" text-anchor="middle">90%</text>
+  
+  <line x1="80" y1="785" x2="650" y2="785" stroke="#6c757d" stroke-width="1" stroke-dasharray="4" />
+  <polygon points="650,785 645,780 645,790" fill="#6c757d" />
+  <text x="300" y="770" font-family="Arial" font-size="12" fill="black" text-anchor="middle">10%</text>
+  
+  <!-- Step 2 -->
+  <rect x="100" y="820" width="600" height="50" fill="#e9ecef" stroke="#adb5bd" stroke-width="1" rx="5" />
+  <text x="400" y="850" font-family="Arial" font-size="14" text-anchor="middle">Step 2: Increase v2 pods and traffic (e.g., 50%)</text>
+  <circle cx="200" cy="845" r="15" fill="#3b82f6" />
+  <text x="200" cy="850" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  <circle cx="350" cy="845" r="15" fill="#3b82f6" />
+  <text x="350" cy="850" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  <circle cx="500" cy="845" r="15" fill="#10b981" />
+  <text x="500" cy="850" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v2</text>
+  <circle cx="650" cy="845" r="15" fill="#10b981" />
+  <text x="650" cy="850" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v2</text>
+  
+  <line x1="80" y1="845" x2="270" y2="845" stroke="#6c757d" stroke-width="2" />
+  <polygon points="270,845 265,840 265,850" fill="#6c757d" />
+  <text x="175" y="840" font-family="Arial" font-size="12" fill="black" text-anchor="middle">50%</text>
+  
+  <line x1="80" y1="845" x2="575" y2="845" stroke="#6c757d" stroke-width="2" stroke-dasharray="4" />
+  <polygon points="575,845 570,840 570,850" fill="#6c757d" />
+  <text x="425" y="830" font-family="Arial" font-size="12" fill="black" text-anchor="middle">50%</text>
+  
+  <!-- Step 3 -->
+  <rect x="100" y="880" width="600" height="50" fill="#e9ecef" stroke="#adb5bd" stroke-width="1" rx="5" />
+  <text x="400" y="910" font-family="Arial" font-size="14" text-anchor="middle">Final State: 100% traffic to v2, remove v1</text>
+  <circle cx="200" cy="905" r="15" fill="#10b981" />
+  <text x="200" cy="910" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v2</text>
+  <circle cx="350" cy="905" r="15" fill="#10b981" />
+  <text x="350" cy="910" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v2</text>
+  <circle cx="500" cy="905" r="15" fill="#10b981" />
+  <text x="500" cy="910" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v2</text>
+  
+  <polygon points="100,905 70,905 80,915 70,925 100,925" fill="#6c757d" />
+  <text x="60" y="910" font-family="Arial" font-size="12" fill="black" text-anchor="middle">Traffic</text>
+  
+  <!-- RECREATE DEPLOYMENT -->
+  <rect x="50" y="1010" width="700" height="170" fill="#f8f9fa" stroke="#ddd" stroke-width="2" rx="10" />
+  <text x="400" y="1040" font-family="Arial" font-size="20" font-weight="bold" text-anchor="middle">Recreate Deployment (All at Once)</text>
+  
+  <!-- Initial state -->
+  <rect x="100" y="1070" width="600" height="50" fill="#e9ecef" stroke="#adb5bd" stroke-width="1" rx="5" />
+  <text x="400" y="1100" font-family="Arial" font-size="14" text-anchor="middle">Initial State: 3 Pods of v1</text>
+  <circle cx="200" cy="1095" r="15" fill="#3b82f6" />
+  <text x="200" cy="1100" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  <circle cx="350" cy="1095" r="15" fill="#3b82f6" />
+  <text x="350" cy="1100" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  <circle cx="500" cy="1095" r="15" fill="#3b82f6" />
+  <text x="500" cy="1100" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1</text>
+  
+  <!-- Final state -->
+  <rect x="100" y="1130" width="600" height="50" fill="#e9ecef" stroke="#adb5bd" stroke-width="1" rx="5" />
+  <text x="400" y="1160" font-family="Arial" font-size="14" text-anchor="middle">Final State: Delete all v1, then create all v2 (downtime)</text>
+  <circle cx="200" cy="1155" r="15" fill="#10b981" />
+  <text x="200" cy="1160" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v2</text>
+  <circle cx="350" cy="1155" r="15" fill="#10b981" />
+  <text x="350" cy="1160" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v2</text>
+  <circle cx="500" cy="1155" r="15" fill="#10b981" />
+  <text x="500" cy="1160" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v2</text>
+  
+  <!-- Legend -->
+  <rect x="650" y="1160" width="100" height="20" fill="#3b82f6" rx="5" />
+  <text x="700" y="1175" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v1 (Blue)</text>
+  
+  <rect x="650" y="1185" width="100" height="20" fill="#10b981" rx="5" />
+  <text x="700" y="1200" font-family="Arial" font-size="12" fill="white" text-anchor="middle">v2 (Green)</text>
+</svg>
