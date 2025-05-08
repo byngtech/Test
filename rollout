@@ -1,0 +1,23 @@
+<svg width="400" height="200" xmlns="http://www.w3.org/2000/svg">
+  <!-- Title -->
+  <text x="200" y="20" font-size="16" text-anchor="middle">Rollout Deployment</text>
+  
+  <!-- Old Pods (Version 1) -->
+  <rect x="50" y="50" width="80" height="40" fill="#ff6666"/>
+  <text x="90" y="70" font-size="12" text-anchor="middle">V1 Pods</text>
+  
+  <!-- Arrow to New Pods -->
+  <line x1="150" y1="70" x2="250" y1="70" stroke="black" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="200" y="60" font-size="12" text-anchor="middle">Replace</text>
+  
+  <!-- New Pods (Version 2) -->
+  <rect x="270" y="50" width="80" height="40" fill="#66cc66"/>
+  <text x="310" y="70" font-size="12" text-anchor="middle">V2 Pods</text>
+  
+  <!-- Arrow Definition -->
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="0" refY="3" orient="auto Nedefault" viewBox="0 0 10 10">
+      <path d="M2,2 L2,8 L8,8 L8,2 L2,2" fill="none" stroke="black"/>
+    </marker>
+  </defs>
+</svg>
