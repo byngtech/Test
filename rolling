@@ -1,0 +1,27 @@
+<svg width="400" height="200" xmlns="http://www.w3.org/2000/svg">
+  <!-- Title -->
+  <text x="200" y="20" font-size="16" text-anchor="middle">Rolling Deployment</text>
+  
+  <!-- Initial State: Old Pods (Version 1) -->
+  <rect x="50" y="50" width="60" height="40" fill="#ff6666"/>
+  <text x="80" y="70" font-size="12" text-anchor="middle">V1</text>
+  <rect x="120" y="50" width="60" height="40" fill="#ff6666"/>
+  <text x="150" y="70" font-size="12" text-anchor="middle">V1</text>
+  
+  <!-- Transition Arrow -->
+  <line x1="190" y1="70" x2="210" y1="70" stroke="black" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="200" y="60" font-size="12" text-anchor="middle">Gradual</text>
+  
+  <!-- Transition State: Mixed Pods -->
+  <rect x="220" y="50" width="60" height="40" fill="#ff6666"/>
+  <text x="250" y="70" font-size="12" text-anchor="middle">V1</text>
+  <rect x="290" y="50" width="60" height="40" fill="#66cc66"/>
+  <text x="320" y="70" font-size="12" text-anchor="middle">V2</text>
+  
+  <!-- Arrow Definition -->
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="0" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 L0,0" fill="black"/>
+    </marker>
+  </defs>
+</svg>
