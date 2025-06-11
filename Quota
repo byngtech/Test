@@ -1,0 +1,741 @@
+pipeline {
+    agent any
+    
+    parameters {
+        string(name: 'HELM_CHART_PATH', defaultValue: './helm-charts/resource-quotas', description: 'Path to Helm chart directory')
+        string(name: 'VALUES_OVERRIDE_FILE', defaultValue: 'values-override.yaml', description: 'Helm values override file containing all namespace quotas')
+        string(name: 'CLUSTER_BUFFER_PERCENTAGE', defaultValue: '15', description: 'Percentage of cluster resources to keep as buffer (0-50)')
+        choice(name: 'ACTION', choices: ['validate', 'deploy', 'dry-run', 'uninstall'], description: 'Action to perform')
+        string(name: 'HELM_RELEASE_NAME', defaultValue: 'cluster-resource-quotas', description: 'Helm release name')
+        string(name: 'KUBECONFIG_CREDENTIAL_ID', defaultValue: 'kubeconfig', description: 'Jenkins credential ID for kubeconfig')
+        booleanParam(name: 'ENFORCE_CLUSTER_LIMITS', defaultValue: true, description: 'Enforce cluster capacity validation')
+        booleanParam(name: 'GENERATE_REPORT', defaultValue: true, description: 'Generate detailed capacity report')
+    }
+    
+    environment {
+        KUBECONFIG = credentials("${params.KUBECONFIG_CREDENTIAL_ID}")
+        HELM_RELEASE = "${params.HELM_RELEASE_NAME}"
+        CHART_PATH = "${params.HELM_CHART_PATH}"
+        VALUES_FILE = "${params.VALUES_OVERRIDE_FILE}"
+    }
+    
+    stages {
+        stage('Validate Prerequisites') {
+            steps {
+                script {
+                    echo "Validating prerequisites and tools..."
+                    sh """
+                        # Check required tools
+                        kubectl version --client
+                        helm version
+                        python3 --version
+                        
+                        # Verify cluster connection
+                        kubectl cluster-info
+                        
+                        # Check if Helm chart exists
+                        if [ ! -d "${env.CHART_PATH}" ]; then
+                            echo "❌ Helm chart directory not found: ${env.CHART_PATH}"
+                            exit 1
+                        fi
+                        
+                        # Check if values file exists
+                        if [ ! -f "${env.VALUES_FILE}" ]; then
+                            echo "❌ Values override file not found: ${env.VALUES_FILE}"
+                            exit 1
+                        fi
+                        
+                        echo "✅ All prerequisites validated"
+                    """
+                }
+            }
+        }
+        
+        stage('Parse Helm Values and Analyze Cluster') {
+            steps {
+                script {
+                    echo "Analyzing cluster capacity and parsing Helm values..."
+                    
+                    sh """
+                        # Create comprehensive analysis script
+                        cat > cluster_quota_analyzer.py << 'EOF'
+import yaml
+import json
+import subprocess
+import sys
+from collections import defaultdict
+import re
+
+def run_kubectl(cmd):
+    """Execute kubectl command and return output"""
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        print(f"Error running command: {cmd}")
+        print(f"Error: {e.stderr}")
+        return None
+
+def parse_memory_to_bytes(mem_str):
+    """Convert memory string to bytes"""
+    if not mem_str or mem_str == "0":
+        return 0
+    
+    mem_str = str(mem_str).strip()
+    units = {
+        'Ki': 1024, 'Mi': 1024**2, 'Gi': 1024**3, 'Ti': 1024**4,
+        'K': 1000, 'M': 1000**2, 'G': 1000**3, 'T': 1000**4,
+        'k': 1000, 'm': 1000**2, 'g': 1000**3, 't': 1000**4
+    }
+    
+    for unit, multiplier in units.items():
+        if mem_str.endswith(unit):
+            try:
+                return float(mem_str[:-len(unit)]) * multiplier
+            except ValueError:
+                return 0
+    
+    # If no unit, try to parse as number (assume bytes)
+    try:
+        return float(mem_str)
+    except ValueError:
+        return 0
+
+def parse_cpu_to_cores(cpu_str):
+    """Convert CPU string to cores"""
+    if not cpu_str or cpu_str == "0":
+        return 0
+    
+    cpu_str = str(cpu_str).strip()
+    if cpu_str.endswith('m'):
+        try:
+            return float(cpu_str[:-1]) / 1000
+        except ValueError:
+            return 0
+    
+    try:
+        return float(cpu_str)
+    except ValueError:
+        return 0
+
+def format_memory(bytes_val):
+    """Format bytes to human readable string"""
+    if bytes_val >= 1024**4:
+        return f"{bytes_val / (1024**4):.2f} TiB"
+    elif bytes_val >= 1024**3:
+        return f"{bytes_val / (1024**3):.2f} GiB"
+    elif bytes_val >= 1024**2:
+        return f"{bytes_val / (1024**2):.2f} MiB"
+    elif bytes_val >= 1024:
+        return f"{bytes_val / 1024:.2f} KiB"
+    else:
+        return f"{bytes_val:.0f} B"
+
+def get_cluster_capacity():
+    """Get total cluster resource capacity"""
+    print("🔍 Analyzing cluster capacity...")
+    
+    nodes_json = run_kubectl("kubectl get nodes -o json")
+    if not nodes_json:
+        return None
+    
+    nodes = json.loads(nodes_json)
+    
+    cluster_info = {
+        'total_cpu': 0,
+        'total_memory': 0,
+        'total_pods': 0,
+        'node_count': len(nodes['items']),
+        'nodes': []
+    }
+    
+    for node in nodes['items']:
+        node_name = node['metadata']['name']
+        capacity = node['status']['capacity']
+        allocatable = node['status'].get('allocatable', capacity)
+        
+        node_cpu = parse_cpu_to_cores(capacity.get('cpu', '0'))
+        node_memory = parse_memory_to_bytes(capacity.get('memory', '0'))
+        node_pods = int(capacity.get('pods', '0'))
+        
+        cluster_info['total_cpu'] += node_cpu
+        cluster_info['total_memory'] += node_memory
+        cluster_info['total_pods'] += node_pods
+        
+        cluster_info['nodes'].append({
+            'name': node_name,
+            'cpu': node_cpu,
+            'memory': node_memory,
+            'pods': node_pods,
+            'allocatable_cpu': parse_cpu_to_cores(allocatable.get('cpu', '0')),
+            'allocatable_memory': parse_memory_to_bytes(allocatable.get('memory', '0')),
+            'allocatable_pods': int(allocatable.get('pods', '0'))
+        })
+    
+    return cluster_info
+
+def parse_helm_values(values_file):
+    """Parse Helm values file to extract namespace quotas"""
+    print(f"📄 Parsing Helm values file: {values_file}")
+    
+    try:
+        with open(values_file, 'r') as f:
+            values = yaml.safe_load(f)
+    except Exception as e:
+        print(f"❌ Error reading values file: {e}")
+        return None
+    
+    namespaces = {}
+    
+    # Handle different possible structures in values file
+    # Common patterns: namespaces.*, resourceQuotas.*, quotas.*
+    namespace_data = None
+    
+    if 'namespaces' in values:
+        namespace_data = values['namespaces']
+    elif 'resourceQuotas' in values:
+        namespace_data = values['resourceQuotas']
+    elif 'quotas' in values:
+        namespace_data = values['quotas']
+    else:
+        # Try to find namespace-like structures
+        for key, value in values.items():
+            if isinstance(value, dict) and any('cpu' in str(v).lower() or 'memory' in str(v).lower() or 'pods' in str(v).lower() for v in str(value).lower().split()):
+                namespace_data = {key: value}
+                break
+    
+    if not namespace_data:
+        print("⚠️  No namespace quota data found in values file")
+        return {}
+    
+    # Parse each namespace configuration
+    for ns_name, ns_config in namespace_data.items():
+        if not isinstance(ns_config, dict):
+            continue
+            
+        quota_config = ns_config
+        
+        # Handle nested quota structures
+        if 'quota' in ns_config:
+            quota_config = ns_config['quota']
+        elif 'resourceQuota' in ns_config:
+            quota_config = ns_config['resourceQuota']
+        elif 'resources' in ns_config:
+            quota_config = ns_config['resources']
+        
+        if not isinstance(quota_config, dict):
+            continue
+        
+        # Extract resource limits
+        namespace_quota = {
+            'name': ns_name,
+            'enabled': quota_config.get('enabled', True),
+            'cpu_requests': 0,
+            'cpu_limits': 0,
+            'memory_requests': 0,
+            'memory_limits': 0,
+            'pods': 0,
+            'services': 0,
+            'raw_config': quota_config
+        }
+        
+        # Parse various quota field patterns
+        for field, value in quota_config.items():
+            field_lower = field.lower()
+            
+            if 'cpu' in field_lower and 'request' in field_lower:
+                namespace_quota['cpu_requests'] = parse_cpu_to_cores(value)
+            elif 'cpu' in field_lower and 'limit' in field_lower:
+                namespace_quota['cpu_limits'] = parse_cpu_to_cores(value)
+            elif 'cpu' in field_lower and 'request' not in field_lower and 'limit' not in field_lower:
+                # Generic CPU field, use for both requests and limits
+                cpu_val = parse_cpu_to_cores(value)
+                namespace_quota['cpu_requests'] = max(namespace_quota['cpu_requests'], cpu_val)
+                namespace_quota['cpu_limits'] = max(namespace_quota['cpu_limits'], cpu_val)
+            
+            elif 'memory' in field_lower and 'request' in field_lower:
+                namespace_quota['memory_requests'] = parse_memory_to_bytes(value)
+            elif 'memory' in field_lower and 'limit' in field_lower:
+                namespace_quota['memory_limits'] = parse_memory_to_bytes(value)
+            elif 'memory' in field_lower and 'request' not in field_lower and 'limit' not in field_lower:
+                # Generic memory field
+                mem_val = parse_memory_to_bytes(value)
+                namespace_quota['memory_requests'] = max(namespace_quota['memory_requests'], mem_val)
+                namespace_quota['memory_limits'] = max(namespace_quota['memory_limits'], mem_val)
+            
+            elif 'pod' in field_lower:
+                try:
+                    namespace_quota['pods'] = int(value)
+                except (ValueError, TypeError):
+                    namespace_quota['pods'] = 0
+            
+            elif 'service' in field_lower:
+                try:
+                    namespace_quota['services'] = int(value)
+                except (ValueError, TypeError):
+                    namespace_quota['services'] = 0
+        
+        # Handle structured quota definitions
+        if 'hard' in quota_config:
+            hard_limits = quota_config['hard']
+            for limit_key, limit_value in hard_limits.items():
+                if limit_key == 'requests.cpu':
+                    namespace_quota['cpu_requests'] = parse_cpu_to_cores(limit_value)
+                elif limit_key == 'limits.cpu':
+                    namespace_quota['cpu_limits'] = parse_cpu_to_cores(limit_value)
+                elif limit_key == 'requests.memory':
+                    namespace_quota['memory_requests'] = parse_memory_to_bytes(limit_value)
+                elif limit_key == 'limits.memory':
+                    namespace_quota['memory_limits'] = parse_memory_to_bytes(limit_value)
+                elif limit_key == 'pods':
+                    namespace_quota['pods'] = int(limit_value)
+                elif limit_key == 'services':
+                    namespace_quota['services'] = int(limit_value)
+        
+        if namespace_quota['enabled']:
+            namespaces[ns_name] = namespace_quota
+    
+    return namespaces
+
+def validate_quotas_against_cluster(cluster_info, namespaces, buffer_percent):
+    """Validate namespace quotas against cluster capacity"""
+    print("\\n🔬 Validating quotas against cluster capacity...")
+    
+    # Calculate buffer
+    available_cpu = cluster_info['total_cpu'] * (1 - buffer_percent / 100)
+    available_memory = cluster_info['total_memory'] * (1 - buffer_percent / 100)
+    available_pods = cluster_info['total_pods'] * (1 - buffer_percent / 100)
+    
+    # Aggregate namespace quotas
+    total_cpu_requests = 0
+    total_cpu_limits = 0
+    total_memory_requests = 0
+    total_memory_limits = 0
+    total_pods = 0
+    total_services = 0
+    
+    enabled_namespaces = 0
+    for ns_name, ns_quota in namespaces.items():
+        if ns_quota['enabled']:
+            enabled_namespaces += 1
+            total_cpu_requests += ns_quota['cpu_requests']
+            total_cpu_limits += ns_quota['cpu_limits']
+            total_memory_requests += ns_quota['memory_requests']
+            total_memory_limits += ns_quota['memory_limits']
+            total_pods += ns_quota['pods']
+            total_services += ns_quota['services']
+    
+    # Validation results
+    results = {
+        'cluster': cluster_info,
+        'totals': {
+            'cpu_requests': total_cpu_requests,
+            'cpu_limits': total_cpu_limits,
+            'memory_requests': total_memory_requests,
+            'memory_limits': total_memory_limits,
+            'pods': total_pods,
+            'services': total_services,
+            'enabled_namespaces': enabled_namespaces
+        },
+        'available': {
+            'cpu': available_cpu,
+            'memory': available_memory,
+            'pods': available_pods
+        },
+        'utilization': {
+            'cpu_requests': (total_cpu_requests / available_cpu * 100) if available_cpu > 0 else 0,
+            'cpu_limits': (total_cpu_limits / available_cpu * 100) if available_cpu > 0 else 0,
+            'memory_requests': (total_memory_requests / available_memory * 100) if available_memory > 0 else 0,
+            'memory_limits': (total_memory_limits / available_memory * 100) if available_memory > 0 else 0,
+            'pods': (total_pods / available_pods * 100) if available_pods > 0 else 0
+        },
+        'errors': [],
+        'warnings': [],
+        'buffer_percent': buffer_percent
+    }
+    
+    # Validation checks
+    if total_cpu_requests > available_cpu:
+        results['errors'].append(f"CPU requests exceed available capacity: {total_cpu_requests:.2f} > {available_cpu:.2f} cores")
+    
+    if total_memory_requests > available_memory:
+        results['errors'].append(f"Memory requests exceed available capacity: {format_memory(total_memory_requests)} > {format_memory(available_memory)}")
+    
+    if total_pods > available_pods:
+        results['errors'].append(f"Pod quotas exceed available capacity: {total_pods} > {available_pods:.0f}")
+    
+    # Warning checks
+    if total_cpu_limits > cluster_info['total_cpu']:
+        results['warnings'].append(f"CPU limits exceed total cluster CPU: {total_cpu_limits:.2f} > {cluster_info['total_cpu']:.2f} cores (may cause throttling)")
+    
+    if total_memory_limits > cluster_info['total_memory']:
+        results['warnings'].append(f"Memory limits exceed total cluster memory: {format_memory(total_memory_limits)} > {format_memory(cluster_info['total_memory'])}")
+    
+    # High utilization warnings
+    if results['utilization']['cpu_requests'] > 80:
+        results['warnings'].append(f"High CPU request utilization: {results['utilization']['cpu_requests']:.1f}%")
+    
+    if results['utilization']['memory_requests'] > 80:
+        results['warnings'].append(f"High memory request utilization: {results['utilization']['memory_requests']:.1f}%")
+    
+    if results['utilization']['pods'] > 80:
+        results['warnings'].append(f"High pod utilization: {results['utilization']['pods']:.1f}%")
+    
+    return results, namespaces
+
+def generate_report(results, namespaces):
+    """Generate detailed capacity report"""
+    print("\\n" + "="*80)
+    print("📊 CLUSTER RESOURCE QUOTA ANALYSIS REPORT")
+    print("="*80)
+    
+    cluster = results['cluster']
+    print(f"\\n🏗️  CLUSTER OVERVIEW:")
+    print(f"   Nodes: {cluster['node_count']}")
+    print(f"   Total CPU: {cluster['total_cpu']:.2f} cores")
+    print(f"   Total Memory: {format_memory(cluster['total_memory'])}")
+    print(f"   Total Pod Capacity: {cluster['total_pods']}")
+    print(f"   Buffer: {results['buffer_percent']}%")
+    
+    available = results['available']
+    print(f"\\n💾 AVAILABLE RESOURCES (after {results['buffer_percent']}% buffer):")
+    print(f"   Available CPU: {available['cpu']:.2f} cores")
+    print(f"   Available Memory: {format_memory(available['memory'])}")
+    print(f"   Available Pod Slots: {available['pods']:.0f}")
+    
+    totals = results['totals']
+    print(f"\\n📋 NAMESPACE QUOTA TOTALS ({totals['enabled_namespaces']} enabled namespaces):")
+    print(f"   CPU Requests: {totals['cpu_requests']:.2f} cores")
+    print(f"   CPU Limits: {totals['cpu_limits']:.2f} cores")
+    print(f"   Memory Requests: {format_memory(totals['memory_requests'])}")
+    print(f"   Memory Limits: {format_memory(totals['memory_limits'])}")
+    print(f"   Pod Quotas: {totals['pods']}")
+    print(f"   Service Quotas: {totals['services']}")
+    
+    util = results['utilization']
+    print(f"\\n📈 RESOURCE UTILIZATION:")
+    print(f"   CPU Requests: {util['cpu_requests']:.1f}%")
+    print(f"   CPU Limits: {util['cpu_limits']:.1f}%")
+    print(f"   Memory Requests: {util['memory_requests']:.1f}%")
+    print(f"   Memory Limits: {util['memory_limits']:.1f}%")
+    print(f"   Pod Capacity: {util['pods']:.1f}%")
+    
+    print(f"\\n📄 NAMESPACE BREAKDOWN:")
+    for ns_name, ns_quota in namespaces.items():
+        if ns_quota['enabled']:
+            print(f"   {ns_name}:")
+            print(f"     CPU: {ns_quota['cpu_requests']:.2f}req/{ns_quota['cpu_limits']:.2f}lim cores")
+            print(f"     Memory: {format_memory(ns_quota['memory_requests'])}req/{format_memory(ns_quota['memory_limits'])}lim")
+            print(f"     Pods: {ns_quota['pods']}, Services: {ns_quota['services']}")
+    
+    print(f"\\n🔍 VALIDATION RESULTS:")
+    if results['errors']:
+        print("   ❌ ERRORS:")
+        for error in results['errors']:
+            print(f"      - {error}")
+    
+    if results['warnings']:
+        print("   ⚠️  WARNINGS:")
+        for warning in results['warnings']:
+            print(f"      - {warning}")
+    
+    if not results['errors'] and not results['warnings']:
+        print("   ✅ All validations passed successfully!")
+    
+    print("\\n" + "="*80)
+    
+    return len(results['errors']) == 0
+
+# Main execution
+if __name__ == "__main__":
+    values_file = "${env.VALUES_FILE}"
+    buffer_percent = float("${params.CLUSTER_BUFFER_PERCENTAGE}")
+    
+    # Get cluster capacity
+    cluster_info = get_cluster_capacity()
+    if not cluster_info:
+        print("❌ Failed to get cluster capacity")
+        sys.exit(1)
+    
+    # Parse Helm values
+    namespaces = parse_helm_values(values_file)
+    if not namespaces:
+        print("❌ Failed to parse namespace quotas from values file")
+        sys.exit(1)
+    
+    # Validate quotas
+    results, namespaces = validate_quotas_against_cluster(cluster_info, namespaces, buffer_percent)
+    
+    # Generate report
+    validation_passed = generate_report(results, namespaces)
+    
+    # Save results for later stages
+    with open('quota_analysis_results.json', 'w') as f:
+        # Convert results to JSON-serializable format
+        json_results = {
+            'validation_passed': validation_passed,
+            'errors': results['errors'],
+            'warnings': results['warnings'],
+            'utilization': results['utilization'],
+            'totals': results['totals'],
+            'cluster_capacity': {
+                'cpu': cluster_info['total_cpu'],
+                'memory': cluster_info['total_memory'],
+                'pods': cluster_info['total_pods'],
+                'nodes': cluster_info['node_count']
+            }
+        }
+        json.dump(json_results, f, indent=2)
+    
+    # Exit codes
+    if results['errors']:
+        print("\\n❌ Validation failed due to errors")
+        sys.exit(1)
+    elif results['warnings']:
+        print("\\n⚠️  Validation completed with warnings")
+        sys.exit(2)
+    else:
+        print("\\n✅ Validation passed successfully")
+        sys.exit(0)
+EOF
+
+                        # Run the analysis
+                        python3 cluster_quota_analyzer.py
+                        analysis_result=\$?
+                        
+                        echo "Analysis completed with exit code: \$analysis_result"
+                        
+                        # Store result for other stages
+                        echo \$analysis_result > analysis_exit_code.txt
+                    """
+                }
+            }
+        }
+        
+        stage('Helm Template Validation') {
+            when {
+                anyOf {
+                    expression { params.ACTION == 'validate' }
+                    expression { params.ACTION == 'deploy' }
+                    expression { params.ACTION == 'dry-run' }
+                }
+            }
+            steps {
+                script {
+                    echo "Validating Helm template generation..."
+                    
+                    sh """
+                        # Template the Helm chart with values
+                        echo "🔧 Templating Helm chart..."
+                        helm template ${env.HELM_RELEASE} ${env.CHART_PATH} \\
+                            -f ${env.VALUES_FILE} \\
+                            --validate \\
+                            --debug > helm_templated_output.yaml
+                        
+                        echo "✅ Helm template validation completed"
+                        echo "Generated $(grep -c '^---' helm_templated_output.yaml) Kubernetes resources"
+                        
+                        # Show sample of generated resources
+                        echo "\\n📄 Sample of generated resources:"
+                        head -50 helm_templated_output.yaml
+                    """
+                }
+            }
+        }
+        
+        stage('Check Analysis Results') {
+            steps {
+                script {
+                    def analysisResult = readFile('analysis_exit_code.txt').trim() as Integer
+                    
+                    if (analysisResult == 1) {
+                        error("❌ Cluster capacity validation failed - deployment blocked")
+                    } else if (analysisResult == 2) {
+                        echo "⚠️  Validation completed with warnings"
+                        if (params.ACTION == 'validate') {
+                            echo "Validation mode: Warnings noted but not blocking"
+                        }
+                    } else {
+                        echo "✅ Cluster capacity validation passed"
+                    }
+                    
+                    // Display analysis summary
+                    if (fileExists('quota_analysis_results.json')) {
+                        def results = readJSON file: 'quota_analysis_results.json'
+                        echo """
+📊 ANALYSIS SUMMARY:
+- Validation Passed: ${results.validation_passed}
+- Errors: ${results.errors.size()}
+- Warnings: ${results.warnings.size()}
+- CPU Utilization: ${results.utilization.cpu_requests.round(1)}%
+- Memory Utilization: ${results.utilization.memory_requests.round(1)}%
+- Pod Utilization: ${results.utilization.pods.round(1)}%
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy Helm Chart') {
+            when {
+                expression { params.ACTION == 'deploy' }
+            }
+            steps {
+                script {
+                    echo "Deploying resource quotas via Helm..."
+                    
+                    sh """
+                        # Deploy or upgrade the Helm release
+                        helm upgrade --install ${env.HELM_RELEASE} ${env.CHART_PATH} \\
+                            -f ${env.VALUES_FILE} \\
+                            --wait \\
+                            --timeout 10m \\
+                            --create-namespace
+                        
+                        echo "✅ Helm deployment completed successfully"
+                        
+                        # Verify deployment
+                        echo "\\n🔍 Verifying deployed resources..."
+                        helm list | grep ${env.HELM_RELEASE}
+                        kubectl get resourcequota --all-namespaces -l app.kubernetes.io/managed-by=Helm
+                    """
+                }
+            }
+        }
+        
+        stage('Dry Run') {
+            when {
+                expression { params.ACTION == 'dry-run' }
+            }
+            steps {
+                script {
+                    echo "Performing Helm dry run..."
+                    
+                    sh """
+                        # Perform dry run
+                        helm upgrade --install ${env.HELM_RELEASE} ${env.CHART_PATH} \\
+                            -f ${env.VALUES_FILE} \\
+                            --dry-run \\
+                            --debug
+                        
+                        echo "✅ Dry run completed successfully"
+                    """
+                }
+            }
+        }
+        
+        stage('Uninstall') {
+            when {
+                expression { params.ACTION == 'uninstall' }
+            }
+            steps {
+                script {
+                    echo "Uninstalling Helm release..."
+                    
+                    sh """
+                        # Uninstall the Helm release
+                        helm uninstall ${env.HELM_RELEASE} --wait || echo "Release not found"
+                        
+                        echo "✅ Helm release uninstalled"
+                        
+                        # Verify cleanup
+                        echo "\\n🔍 Verifying cleanup..."
+                        kubectl get resourcequota --all-namespaces -l app.kubernetes.io/managed-by=Helm | grep ${env.HELM_RELEASE} || echo "No remaining quotas found"
+                    """
+                }
+            }
+        }
+        
+        stage('Generate Final Report') {
+            when {
+                expression { params.GENERATE_REPORT == true }
+            }
+            steps {
+                script {
+                    echo "Generating final deployment report..."
+                    
+                    sh """
+                        # Create final report
+                        cat > final_report.md << 'EOF'
+# Resource Quota Deployment Report
+
+## Deployment Details
+- **Action**: ${params.ACTION}
+- **Helm Release**: ${env.HELM_RELEASE}
+- **Chart Path**: ${env.CHART_PATH}
+- **Values File**: ${env.VALUES_FILE}
+- **Timestamp**: \$(date)
+
+## Cluster Information
+EOF
+                        
+                        # Add cluster info to report
+                        if [ -f quota_analysis_results.json ]; then
+                            python3 << 'PYEOF'
+import json
+with open('quota_analysis_results.json', 'r') as f:
+    results = json.load(f)
+
+cluster = results['cluster_capacity']
+print(f"- **Cluster Nodes**: {cluster['nodes']}")
+print(f"- **Total CPU**: {cluster['cpu']:.2f} cores")
+print(f"- **Total Memory**: {cluster['memory'] / (1024**3):.2f} GiB")
+print(f"- **Total Pod Capacity**: {cluster['pods']}")
+
+print(f"\\n## Resource Utilization")
+util = results['utilization']
+print(f"- **CPU Requests**: {util['cpu_requests']:.1f}%")
+print(f"- **Memory Requests**: {util['memory_requests']:.1f}%")
+print(f"- **Pod Capacity**: {util['pods']:.1f}%")
+
+if results['errors']:
+    print(f"\\n## ❌ Errors")
+    for error in results['errors']:
+        print(f"- {error}")
+
+if results['warnings']:
+    print(f"\\n## ⚠️ Warnings")
+    for warning in results['warnings']:
+        print(f"- {warning}")
+
+if results['validation_passed']:
+    print(f"\\n## ✅ Status: PASSED")
+else:
+    print(f"\\n## ❌ Status: FAILED")
+PYEOF
+                        fi >> final_report.md
+                        
+                        echo "\\n## Deployed Resources" >> final_report.md
+                        if [ "${params.ACTION}" = "deploy" ]; then
+                            echo "\\n\`\`\`" >> final_report.md
+                            kubectl get resourcequota --all-namespaces -l app.kubernetes.io/managed-by=Helm >> final_report.md 2>/dev/null || echo "No resources found" >> final_report.md
+                            echo "\`\`\`" >> final_report.md
+                        fi
+                        
+                        echo "\\n📄 Final report generated:"
+                        cat final_report.md
+                    """
+                    
+                    // Archive the report
+                    archiveArtifacts artifacts: 'final_report.md, quota_analysis_results.json, helm_templated_output.yaml', allowEmptyArchive: true
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                echo "🧹 Cleaning up temporary files..."
+                sh """
+                    rm -f cluster_quota_analyzer.py
+                    rm -f analysis_exit_code.txt
+                """
+            }
+        }
+        
+        success {
+            script {
+                echo "✅ Pipeline completed successfully!"
+                
+                if (fileExists('quota_analysis_results.json')) {
