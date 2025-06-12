@@ -1,0 +1,118 @@
+pipeline {
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: gcloud
+    image: google/cloud-sdk:slim
+    command:
+    - sleep
+    args:
+    - infinity
+    env:
+    - name: GOOGLE_APPLICATION_CREDENTIALS
+      value: /path/to/service-account-key.json
+  - name: helm
+    image: alpine/helm:3.10.0
+    command:
+    - sleep
+    args:
+    - infinity
+'''
+        }
+    }
+    environment {
+        CLUSTER_NAME = 'your-gke-cluster-name'
+        PROJECT_ID = 'your-gcp-project-id'
+        REGION = 'your-cluster-region'
+        SA_KEY = credentials('gke-service-account-key') // Jenkins secret for service account key
+    }
+    stages {
+        stage('Setup gcloud and kubectl') {
+            steps {
+                container('gcloud') {
+                    sh '''
+                        gcloud auth activate-service-account --key-file=$SA_KEY
+                        gcloud container clusters get-credentials $CLUSTER_NAME --region $REGION --project $PROJECT_ID
+                        kubectl version
+                    '''
+                }
+            }
+        }
+        stage('Check Cluster Capacity and Management Namespace Usage') {
+            steps {
+                container('gcloud') {
+                    script {
+                        // Get total cluster capacity (CPU, memory, pods)
+                        def nodeOutput = sh(script: 'kubectl get nodes -o json', returnStdout: true)
+                        def nodes = readJSON(text: nodeOutput).items
+                        def totalCpu = 0
+                        def totalMemory = 0
+                        def totalPods = 0
+
+                        nodes.each { node ->
+                            def cpu = node.status.allocatable.cpu
+                            def memory = node.status.allocatable.memory
+                            def pods = node.status.allocatable.pods.toInteger()
+                            // Convert CPU (e.g., "3920m" to millicores)
+                            if (cpu.endsWith('m')) {
+                                totalCpu += cpu.replace('m', '').toInteger()
+                            } else {
+                                totalCpu += cpu.toInteger() * 1000
+                            }
+                            // Convert memory (e.g., "13498416Ki" to GiB)
+                            if (memory.endsWith('Ki')) {
+                                totalMemory += memory.replace('Ki', '').toFloat() / (1024 * 1024) // Convert Ki to Gi
+                            } else if (memory.endsWith('Mi')) {
+                                totalMemory += memory.replace('Mi', '').toFloat() / 1024 // Convert Mi to Gi
+                            } else if (memory.endsWith('Gi')) {
+                                totalMemory += memory.replace('Gi', '').toFloat()
+                            }
+                            totalPods += pods
+                        }
+
+                        // Get pod and service IP capacity
+                        def clusterInfo = sh(script: "gcloud container clusters describe $CLUSTER_NAME --region $REGION --project $PROJECT_ID", returnStdout: true)
+                        def podCidr = clusterInfo =~ /clusterIpv4Cidr: (\S+)/
+                        def serviceCidr = clusterInfo =~ /servicesIpv4Cidr: (\S+)/
+                        def totalPodIpCount = podCidr ? calculateIpCount(podCidr[0][1]) : 0
+                        def totalServiceIpCount = serviceCidr ? calculateIpCount(serviceCidr[0][1]) : 0
+
+                        // Get management namespace usage (namespaces not starting with 'ns-kcl')
+                        def namespaceOutput = sh(script: 'kubectl get namespaces -o json', returnStdout: true)
+                        def namespaces = readJSON(text: namespaceOutput).items
+                        def mgmtCpuRequests = 0
+                        def mgmtCpuLimits = 0
+                        def mgmtMemoryRequests = 0
+                        def mgmtMemoryLimits = 0
+                        def mgmtActualPods = 0
+                        def mgmtServices = 0
+
+                        namespaces.each { ns ->
+                            def nsName = ns.metadata.name
+                            if (!nsName.startsWith('ns-kcl')) {
+                                // Get actual pod usage (running pods)
+                                def podOutput = sh(script: "kubectl get pods -n ${nsName} --field-selector=status.phase=Running -o json 2>/dev/null || echo '{}'", returnStdout: true)
+                                def pods = readJSON(text: podOutput).items
+                                mgmtActualPods += pods.size()
+
+                                // Get ResourceQuota for CPU, memory, and services
+                                def quotaOutput = sh(script: "kubectl get resourcequota -n ${nsName} -o json 2>/dev/null || echo '{}'", returnStdout: true)
+                                def quotas = readJSON(text: quotaOutput).items
+                                quotas.each { quota ->
+                                    def hard = quota.spec.hard
+                                    if (hard) {
+                                        // CPU requests and limits
+                                        if (hard['requests.cpu']) {
+                                            if (hard['requests.cpu'].endsWith('m')) {
+                                                mgmtCpuRequests += hard['requests.cpu'].replace('m', '').toInteger()
+                                            } else {
+                                                mgmtCpuRequests += hard['requests.cpu'].toFloat() * 1000
+                                            }
+                                        }
+                                        if (hard['limits.cpu']) {
+                                            if (hard['limits.cpu'].endsWith('m')) {
+                                                mgmtCpuLimits += hard['limits.cpu'].replace('m', '').toInteger()
