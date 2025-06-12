@@ -1,0 +1,88 @@
+pipeline {
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: kubectl
+    image: bitnami/kubectl:latest
+    command:
+    - cat
+    tty: true
+    securityContext:
+      runAsUser: 1000
+  serviceAccountName: jenkins
+'''
+        }
+    }
+    environment {
+        // Adjust kubeconfig path or use in-cluster auth
+        KUBECONFIG = '/home/jenkins/.kube/config'
+    }
+    stages {
+        stage('Gather Kubernetes Resource Usage') {
+            steps {
+                container('kubectl') {
+                    script {
+                        // Initialize output file
+                        sh 'echo "Kubernetes Management Namespace Usage Report" > report.txt'
+                        sh 'echo "Generated at: $(date)" >> report.txt'
+                        sh 'echo "----------------------------------------" >> report.txt'
+
+                        // Get management namespaces (excluding those starting with 'ns')
+                        def namespaces = sh(script: "kubectl get namespaces --no-headers | grep -v '^ns' | awk '{print \$1}'", returnStdout: true).trim().split('\n')
+
+                        // Loop through each namespace
+                        for (ns in namespaces) {
+                            echo "Processing namespace: ${ns}"
+                            sh "echo 'Namespace: ${ns}' >> report.txt"
+
+                            // Get pod count
+                            def podCount = sh(script: "kubectl get pods -n ${ns} --no-headers | wc -l", returnStdout: true).trim()
+                            sh "echo 'Pod Count: ${podCount}' >> report.txt"
+
+                            // Get pod IPs (same as pod count for running pods)
+                            def podIpCount = sh(script: "kubectl get pods -n ${ns} --no-headers -o wide | grep Running | wc -l", returnStdout: true).trim()
+                            sh "echo 'Pod IPs Used: ${podIpCount}' >> report.txt"
+
+                            // Get service IPs (ClusterIP services)
+                            def serviceIpCount = sh(script: "kubectl get services -n ${ns} --no-headers | grep -v 'None' | wc -l", returnStdout: true).trim()
+                            sh "echo 'Service IPs Used: ${serviceIpCount}' >> report.txt"
+
+                            // Get CPU and memory usage
+                            try {
+                                def cpuOutput = sh(script: "kubectl top pods -n ${ns} --sort-by=cpu --no-headers", returnStdout: true).trim()
+                                def memoryOutput = sh(script: "kubectl top pods -n ${ns} --sort-by=memory --no-headers", returnStdout: true).trim()
+                                sh "echo 'CPU Usage:' >> report.txt"
+                                sh "echo '${cpuOutput}' >> report.txt"
+                                sh "echo 'Memory Usage:' >> report.txt"
+                                sh "echo '${memoryOutput}' >> report.txt"
+                            } catch (Exception e) {
+                                sh "echo 'Error retrieving CPU/Memory usage for ${ns}: ${e.getMessage()}' >> report.txt"
+                            }
+
+                            sh "echo '----------------------------------------' >> report.txt"
+                        }
+
+                        // Print report to console
+                        sh 'cat report.txt'
+                    }
+                }
+            }
+        }
+        stage('Archive Report') {
+            steps {
+                // Archive the report as a pipeline artifact
+                archiveArtifacts artifacts: 'report.txt', allowEmptyArchive: true
+            }
+        }
+    }
+    post {
+        always {
+            // Clean up workspace
+            cleanWs()
+        }
+    }
+}
