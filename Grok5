@@ -1,0 +1,283 @@
+pipeline {
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: gcloud
+    image: google/cloud-sdk:slim
+    command:
+    - sleep
+    args:
+    - infinity
+    env:
+    - name: GOOGLE_APPLICATION_CREDENTIALS
+      value: /path/to/service-account-key.json
+  - name: helm
+    image: alpine/helm:3.10.0
+    command:
+    - sleep
+    args:
+    - infinity
+'''
+        }
+    }
+    environment {
+        CLUSTER_NAME = 'your-gke-cluster-name'
+        PROJECT_ID = 'your-gcp-project-id'
+        REGION = 'your-cluster-region'
+        SA_KEY = credentials('gke-service-account-key')
+    }
+    stages {
+        stage('Setup gcloud and kubectl') {
+            steps {
+                container('gcloud') {
+                    sh '''
+                        gcloud auth activate-service-account --key-file=$SA_KEY
+                        gcloud container clusters get-credentials $CLUSTER_NAME --region $REGION --project $PROJECT_ID
+                        kubectl version
+                    '''
+                }
+            }
+        }
+        stage('Check Cluster Capacity and Management Namespace Usage') {
+            steps {
+                container('gcloud') {
+                    script {
+                        // Get total cluster capacity
+                        def nodeOutput = sh(script: 'kubectl get nodes -o json', returnStdout: true)
+                        def nodes = readJSON(text: nodeOutput).items
+                        nodeOutput = null
+                        def totalCpu = 0
+                        def totalMemory = 0
+                        def totalPods = 0
+
+                        nodes.each { node ->
+                            def cpu = node.status.allocatable.cpu
+                            def memory = node.status.allocatable.memory
+                            def pods = node.status.allocatable.pods.toInteger()
+                            if (cpu.endsWith('m')) {
+                                totalCpu += cpu.replace('m', '').toInteger()
+                            } else {
+                                totalCpu += cpu.toInteger() * 1000
+                            }
+                            if (memory.endsWith('Ki')) {
+                                totalMemory += memory.replace('Ki', '').toFloat() / (1024 * 1024)
+                            } else if (memory.endsWith('Mi')) {
+                                totalMemory += memory.replace('Mi', '').toFloat() / 1024
+                            } else if (memory.endsWith('Gi')) {
+                                totalMemory += memory.replace('Gi', '').toFloat()
+                            }
+                            totalPods += pods
+                        }
+
+                        // Get pod and service IP capacity
+                        def clusterInfo = sh(script: "gcloud container clusters describe $CLUSTER_NAME --region $REGION --project $PROJECT_ID", returnStdout: true)
+                        def podCidr = clusterInfo =~ /clusterIpv4Cidr: (\S+)/
+                        def serviceCidr = clusterInfo =~ /servicesIpv4Cidr: (\S+)/
+                        clusterInfo = null
+                        def totalPodIpCount = podCidr ? calculateIpCount(podCidr[0][1]) : 0
+                        def totalServiceIpCount = serviceCidr ? calculateIpCount(serviceCidr[0][1]) : 0
+
+                        // Get management namespace usage
+                        def mgmtResources
+                        try {
+                            mgmtResources = getManagementNamespaceResources()
+                        } catch (Exception e) {
+                            error "Failed to process management namespaces: ${e.message}"
+                        }
+
+                        // Calculate remaining capacity
+                        def availableCpu = totalCpu - [mgmtResources.cpuRequests, mgmtResources.cpuLimits].max()
+                        def availableMemory = totalMemory - [mgmtResources.memoryRequests, mgmtResources.memoryLimits].max()
+                        def availablePods = totalPods - mgmtResources.actualPods
+                        def availableServices = totalServiceIpCount - mgmtResources.services
+
+                        if (availableCpu < 0 || availableMemory < 0 || availablePods < 0 || availableServices < 0) {
+                            error "Management namespace usage exceeds total cluster capacity: CPU=${availableCpu}m, Memory=${availableMemory}Gi, Pods=${availablePods}, Services=${availableServices}"
+                        }
+
+                        // Aggregate ResourceQuota from values.yaml
+                        def valuesYaml = readYaml file: 'my-resource-quotas/values.yaml'
+                        def totalQuotaCpuRequests = 0
+                        def totalQuotaCpuLimits = 0
+                        def totalQuotaMemoryRequests = 0
+                        def totalQuotaMemoryLimits = 0
+                        def totalQuotaPods = 0
+                        def totalQuotaServices = 0
+
+                        valuesYaml.namespaces.each { ns ->
+                            def rq = ns.resourceQuota
+                            if (rq.requests.cpu.endsWith('m')) {
+                                totalQuotaCpuRequests += rq.requests.cpu.replace('m', '').toInteger()
+                            } else {
+                                totalQuotaCpuRequests += rq.requests.cpu.toFloat() * 1000
+                            }
+                            if (rq.limits.cpu.endsWith('m')) {
+                                totalQuotaCpuLimits += rq.limits.cpu.replace('m', '').toInteger()
+                            } else {
+                                totalQuotaCpuLimits += rq.limits.cpu.toFloat() * 1000
+                            }
+                            if (rq.requests.memory.endsWith('Gi')) {
+                                totalQuotaMemoryRequests += rq.requests.memory.replace('Gi', '').toFloat()
+                            } else if (rq.requests.memory.endsWith('Mi')) {
+                                totalQuotaMemoryRequests += rq.requests.memory.replace('Mi', '').toFloat() / 1024
+                            }
+                            if (rq.limits.memory.endsWith('Gi')) {
+                                totalQuotaMemoryLimits += rq.limits.memory.replace('Gi', '').toFloat()
+                            } else if (rq.limits.memory.endsWith('Mi')) {
+                                totalQuotaMemoryLimits += rq.limits.memory.replace('Mi', '').toFloat() / 1024
+                            }
+                            totalQuotaPods += rq.pods.toInteger()
+                            totalQuotaServices += rq.services.toInteger()
+                        }
+
+                        // Validate quotas
+                        if (totalQuotaCpuRequests > availableCpu || totalQuotaCpuLimits > availableCpu) {
+                            error "CPU quota (requests: ${totalQuotaCpuRequests}m, limits: ${totalQuotaCpuLimits}m) exceeds available capacity (${availableCpu}m)"
+                        }
+                        if (totalQuotaMemoryRequests > availableMemory || totalQuotaMemoryLimits > availableMemory) {
+                            error "Memory quota (requests: ${totalQuotaMemoryRequests}Gi, limits: ${totalQuotaMemoryLimits}Gi) exceeds available capacity (${availableMemory}Gi)"
+                        }
+                        if (totalQuotaPods > availablePods) {
+                            error "Pod quota (${totalQuotaPods}) exceeds available capacity (${availablePods})"
+                        }
+                        if (totalQuotaServices > availableServices) {
+                            error "Service quota (${totalQuotaServices}) exceeds available capacity (${availableServices})"
+                        }
+
+                        env.CLUSTER_CAPACITY = "Total CPU: ${totalCpu}m, Total Memory: ${totalMemory}Gi, Total Pods: ${totalPods}, Total Service IPs: ${totalServiceIpCount}"
+                        env.MGMT_USAGE = "Management CPU Requests: ${mgmtResources.cpuRequests}m, CPU Limits: ${mgmtResources.cpuLimits}m, Memory Requests: ${mgmtResources.memoryRequests}Gi, Memory Limits: ${mgmtResources.memoryLimits}Gi, Actual Pods: ${mgmtResources.actualPods}, Services: ${mgmtResources.services}"
+                        env.AVAILABLE_CAPACITY = "Available CPU: ${availableCpu}m, Available Memory: ${availableMemory}Gi, Available Pods: ${availablePods}, Available Services: ${availableServices}"
+                        env.QUOTA_USAGE = "Quota CPU Requests: ${totalQuotaCpuRequests}m, CPU Limits: ${totalQuotaCpuLimits}m, Memory Requests: ${totalQuotaMemoryRequests}Gi, Memory Limits: ${totalQuotaMemoryLimits}Gi, Pods: ${totalQuotaPods}, Services: ${totalQuotaServices}"
+                    }
+                }
+            }
+        }
+        stage('Deploy Helm Chart') {
+            steps {
+                container('helm') {
+                    sh '''
+                        helm upgrade --install my-resource-quotas ./my-resource-quotas -f my-resource-quotas/values.yaml
+                    '''
+                }
+            }
+        }
+    }
+    post {
+        success {
+            echo "Cluster Capacity: ${env.CLUSTER_CAPACITY}"
+            echo "Management Namespace Usage: ${env.MGMT_USAGE}"
+            echo "Available Capacity: ${env.AVAILABLE_CAPACITY}"
+            echo "Quota Usage: ${env.QUOTA_USAGE}"
+            echo "Helm chart deployed successfully!"
+        }
+        failure {
+            echo "Cluster Capacity: ${env.CLUSTER_CAPACITY}"
+            echo "Management Namespace Usage: ${env.MGMT_USAGE}"
+            echo "Available Capacity: ${env.AVAILABLE_CAPACITY}"
+            echo "Quota Usage: ${env.QUOTA_USAGE}"
+            echo "Deployment failed due to quota exceeding available capacity."
+        }
+    }
+}
+
+// @NonCPS method to process management namespaces
+@NonCPS
+def getManagementNamespaceResources() {
+    // Get namespace names, excluding ns-kcl*
+    def nsListOutput = sh(script: "kubectl get namespace -o name | sed 's|namespace/||' | grep -v '^ns-kcl' || true", returnStdout: true).trim()
+    def namespaces = nsListOutput ? nsListOutput.split('\n') : []
+    def cpuRequests = 0
+    def cpuLimits = 0
+    def memoryRequests = 0
+    def memoryLimits = 0
+    def actualPods = 0
+    def services = 0
+
+    if (namespaces.empty) {
+        println "No management namespaces found (not starting with ns-kcl)"
+        return [
+            cpuRequests: 0,
+            cpuLimits: 0,
+            memoryRequests: 0,
+            memoryLimits: 0,
+            actualPods: 0,
+            services: 0
+        ]
+    }
+
+    namespaces.each { nsName ->
+        try {
+            // Get actual pod usage
+            def podOutput = sh(script: "kubectl get pods -n ${nsName} --field-selector=status.phase=Running -o json 2>/dev/null || echo '{}'", returnStdout: true)
+            def pods = readJSON(text: podOutput).items
+            actualPods += pods.size()
+
+            // Get ResourceQuota
+            def quotaOutput = sh(script: "kubectl get resourcequota -n ${nsName} -o json 2>/dev/null || echo '{}'", returnStdout: true)
+            def quotas = readJSON(text: quotaOutput).items
+            quotas.each { quota ->
+                def hard = quota.spec.hard
+                if (hard) {
+                    if (hard['requests.cpu']) {
+                        if (hard['requests.cpu'].endsWith('m')) {
+                            cpuRequests += hard['requests.cpu'].replace('m', '').toInteger()
+                        } else {
+                            cpuRequests += hard['requests.cpu'].toFloat() * 1000
+                        }
+                    }
+                    if (hard['limits.cpu']) {
+                        if (hard['limits.cpu'].endsWith('m')) {
+                            cpuLimits += hard['limits.cpu'].replace('m', '').toInteger()
+                        } else {
+                            cpuLimits += hard['limits.cpu'].toFloat() * 1000
+                        }
+                    }
+                    if (hard['requests.memory']) {
+                        if (hard['requests.memory'].endsWith('Gi')) {
+                            memoryRequests += hard['requests.memory'].replace('Gi', '').toFloat()
+                        } else if (hard['requests.memory'].endsWith('Mi')) {
+                            memoryRequests += hard['requests.memory'].replace('Mi', '').toFloat() / 1024
+                        }
+                    }
+                    if (hard['limits.memory']) {
+                        if (hard['limits.memory'].endsWith('Gi')) {
+                            memoryLimits += hard['limits.memory'].replace('Gi', '').toFloat()
+                        } else if (hard['limits.memory'].endsWith('Mi')) {
+                            memoryLimits += hard['limits.memory'].replace('Mi', '').toFloat() / 1024
+                        }
+                    }
+                    if (hard['services']) {
+                        services += hard['services'].toInteger()
+                    }
+                }
+            }
+        } catch (Exception e) {
+            println "Warning: Failed to process namespace ${nsName}: ${e.message}"
+        }
+    }
+
+    return [
+        cpuRequests: cpuRequests,
+        cpuLimits: cpuLimits,
+        memoryRequests: memoryRequests,
+        memoryLimits: memoryLimits,
+        actualPods: actualPods,
+        services: services
+    ]
+}
+
+// Helper function to calculate IP count from CIDR
+def calculateIpCount(cidr) {
+    if (!cidr || !cidr.contains('/')) {
+        error "Invalid CIDR format: ${cidr}"
+    }
+    def mask = cidr.split('/')[1].toInteger()
+    if (mask < 0 || mask > 32) {
+        error "Invalid CIDR mask: ${mask}"
+    }
+    return (2 ** (32 - mask)) - 2
+}
