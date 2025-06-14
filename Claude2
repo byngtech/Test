@@ -1,0 +1,182 @@
+// Get namespace list (your existing code)
+def nsListOutput = sh(script: "kubectl get namespace -o jsonpath='{range .items[*]{.metadata.name}{\"\\n\"}{end}' |  grep -v '^ns-kcl' || true", returnStdout: true).trim()
+def namespaces = nsListOutput ? nsListOutput.readLines().findAll { it.trim() } : []
+
+// Initialize totals
+def totalStats = [
+    totalPods: 0,
+    totalServices: 0,
+    totalLimitsCpu: 0.0,
+    totalRequestsCpu: 0.0,
+    totalLimitsMem: 0.0,
+    totalRequestsMem: 0.0
+]
+
+// Function to convert CPU values to millicores
+def convertCpuToMillicores(cpuValue) {
+    if (!cpuValue || cpuValue == "0") return 0.0
+    if (cpuValue.endsWith('m')) {
+        return cpuValue.replace('m', '') as Double
+    } else {
+        return (cpuValue as Double) * 1000
+    }
+}
+
+// Function to convert memory values to bytes
+def convertMemoryToBytes(memValue) {
+    if (!memValue || memValue == "0") return 0.0
+    def value = memValue.replaceAll(/[^0-9.]/, '') as Double
+    if (memValue.endsWith('Ki')) return value * 1024
+    if (memValue.endsWith('Mi')) return value * 1024 * 1024
+    if (memValue.endsWith('Gi')) return value * 1024 * 1024 * 1024
+    if (memValue.endsWith('Ti')) return value * 1024 * 1024 * 1024 * 1024
+    return value // assume bytes if no suffix
+}
+
+echo "=== Kubernetes Namespace Metrics Report ==="
+echo "Analyzing ${namespaces.size()} namespaces..."
+echo ""
+
+// Iterate through each namespace
+namespaces.each { namespace ->
+    echo "Processing namespace: ${namespace}"
+    
+    try {
+        // Get running pod count
+        def podCountOutput = sh(script: """
+            kubectl get pods -n ${namespace} --field-selector=status.phase=Running --no-headers | wc -l
+        """, returnStdout: true).trim()
+        
+        // Get pod names and IPs (running pods only)
+        def podIpsOutput = sh(script: """
+            kubectl get pods -n ${namespace} --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{.metadata.name}{","}{.status.podIP}{"|"}{end}' || true
+        """, returnStdout: true).trim()
+        
+        // Get CPU requests for running pods
+        def cpuRequestsOutput = sh(script: """
+            kubectl get pods -n ${namespace} --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.resources.requests.cpu}{"|"}{end}{end}' || true
+        """, returnStdout: true).trim()
+        
+        // Get CPU limits for running pods
+        def cpuLimitsOutput = sh(script: """
+            kubectl get pods -n ${namespace} --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.resources.limits.cpu}{"|"}{end}{end}' || true
+        """, returnStdout: true).trim()
+        
+        // Get memory requests for running pods
+        def memoryRequestsOutput = sh(script: """
+            kubectl get pods -n ${namespace} --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.resources.requests.memory}{"|"}{end}{end}' || true
+        """, returnStdout: true).trim()
+        
+        // Get memory limits for running pods
+        def memoryLimitsOutput = sh(script: """
+            kubectl get pods -n ${namespace} --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.resources.limits.memory}{"|"}{end}{end}' || true
+        """, returnStdout: true).trim()
+        
+        // Get service count only (excluding kubernetes service)
+        def serviceCountOutput = sh(script: """
+            kubectl get services -n ${namespace} --no-headers 2>/dev/null | grep -v kubernetes | wc -l || echo "0"
+        """, returnStdout: true).trim()
+        
+        // Parse the data
+        def podCount = podCountOutput as Integer
+        def serviceCount = serviceCountOutput as Integer
+        def pods = []
+        def namespaceLimitsCpu = 0.0
+        def namespaceRequestsCpu = 0.0
+        def namespaceLimitsMem = 0.0
+        def namespaceRequestsMem = 0.0
+        
+        // Parse pod IPs
+        if (podIpsOutput) {
+            def podEntries = podIpsOutput.tokenize('|')
+            podEntries.each { podEntry ->
+                if (podEntry.trim()) {
+                    def parts = podEntry.tokenize(',')
+                    if (parts.size() >= 2) {
+                        pods.add([name: parts[0], ip: parts[1]])
+                    }
+                }
+            }
+        }
+        
+        // Parse and sum CPU requests
+        if (cpuRequestsOutput) {
+            def cpuEntries = cpuRequestsOutput.tokenize('|')
+            cpuEntries.each { cpu ->
+                if (cpu.trim()) {
+                    namespaceRequestsCpu += convertCpuToMillicores(cpu.trim())
+                }
+            }
+        }
+        
+        // Parse and sum CPU limits
+        if (cpuLimitsOutput) {
+            def cpuEntries = cpuLimitsOutput.tokenize('|')
+            cpuEntries.each { cpu ->
+                if (cpu.trim()) {
+                    namespaceLimitsCpu += convertCpuToMillicores(cpu.trim())
+                }
+            }
+        }
+        
+        // Parse and sum memory requests
+        if (memoryRequestsOutput) {
+            def memEntries = memoryRequestsOutput.tokenize('|')
+            memEntries.each { memory ->
+                if (memory.trim()) {
+                    namespaceRequestsMem += convertMemoryToBytes(memory.trim())
+                }
+            }
+        }
+        
+        // Parse and sum memory limits
+        if (memoryLimitsOutput) {
+            def memEntries = memoryLimitsOutput.tokenize('|')
+            memEntries.each { memory ->
+                if (memory.trim()) {
+                    namespaceLimitsMem += convertMemoryToBytes(memory.trim())
+                }
+            }
+        }
+        
+        // Update totals
+        totalStats.totalPods += podCount
+        totalStats.totalServices += serviceCount
+        totalStats.totalLimitsCpu += namespaceLimitsCpu
+        totalStats.totalRequestsCpu += namespaceRequestsCpu
+        totalStats.totalLimitsMem += namespaceLimitsMem
+        totalStats.totalRequestsMem += namespaceRequestsMem
+        
+        // Display namespace summary
+        echo "  Namespace: ${namespace}"
+        echo "  Running Pods: ${podCount}"
+        echo "  Services: ${serviceCount}"
+        echo "  CPU Limits: ${namespaceLimitsCpu}m"
+        echo "  CPU Requests: ${namespaceRequestsCpu}m"
+        echo "  Memory Limits: ${(namespaceLimitsMem / (1024*1024)).round(2)}Mi"
+        echo "  Memory Requests: ${(namespaceRequestsMem / (1024*1024)).round(2)}Mi"
+        
+        // Display pod IPs
+        if (pods.size() > 0) {
+            echo "  Pod IPs:"
+            pods.each { pod ->
+                echo "    ${pod.name}: ${pod.ip ?: 'N/A'}"
+            }
+        }
+        
+        echo ""
+        
+    } catch (Exception e) {
+        echo "  Error processing namespace ${namespace}: ${e.message}"
+        echo ""
+    }
+}
+
+// Display final totals
+echo "=== SUMMARY TOTALS ==="
+echo "Total Running Pods: ${totalStats.totalPods}"
+echo "Total Services: ${totalStats.totalServices}"
+echo "Total CPU Limits: ${totalStats.totalLimitsCpu}m (${(totalStats.totalLimitsCpu/1000).round(2)} cores)"
+echo "Total CPU Requests: ${totalStats.totalRequestsCpu}m (${(totalStats.totalRequestsCpu/1000).round(2)} cores)"
+echo "Total Memory Limits: ${(totalStats.totalLimitsMem / (1024*1024*1024)).round(2)}Gi"
+echo "Total Memory Requests: ${(totalStats.totalRequestsMem / (1024*1024*1024)).round(2)}Gi"
