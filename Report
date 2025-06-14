@@ -1,0 +1,202 @@
+pipeline {
+    agent any
+    stages {
+        stage('Calculate Values and Generate Report') {
+            steps {
+                script {
+                    // Example values (replace with your actual calculations)
+                    def totalPods = 100
+                    def totalServices = 50
+                    def totalCPU = "32 cores"
+                    def totalMemory = "64Gi"
+                    def mgmtPods = 10
+                    def mgmtServices = 5
+                    def mgmtCPURequests = "4 cores"
+                    def mgmtMemoryRequests = "8Gi"
+                    def mgmtCPULimits = "6 cores"
+                    def mgmtMemoryLimits = "12Gi"
+                    def quotaPods = 80
+                    def quotaServices = 40
+                    def quotaCPURequests = "20 cores"
+                    def quotaMemoryRequests = "40Gi"
+                    def quotaCPULimits = "24 cores"
+                    def quotaMemoryLimits = "48Gi"
+                    def availablePods = 20
+                    def availableServices = 10
+                    def availableCPU = 12  // Numeric for chart
+                    def availableMemory = 16  // Numeric for chart (e.g., in GiB)
+                    def softLimitCPU = "10 cores"
+                    def softLimitMemory = "20Gi"
+
+                    // HTML content with replaced values
+                    def htmlContent = """
+                    <!DOCTYPE html>
+                    <html>
+                    <head>
+                        <title>Kubernetes Cluster Report</title>
+                        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+                        <style>
+                            body {
+                                font-family: Arial, sans-serif;
+                                margin: 20px;
+                                background-color: #f5f5f5;
+                            }
+                            h2 {
+                                color: #333;
+                                border-bottom: 2px solid #007bff;
+                                padding-bottom: 5px;
+                            }
+                            .section {
+                                margin-bottom: 20px;
+                            }
+                            table {
+                                border-collapse: collapse;
+                                width: 60%;
+                                margin-bottom: 20px;
+                                background-color: #fff;
+                                box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+                            }
+                            th, td {
+                                border: 1px solid #ddd;
+                                padding: 10px;
+                                text-align: left;
+                            }
+                            th {
+                                background-color: #007bff;
+                                color: white;
+                            }
+                            tr:nth-child(even) {
+                                background-color: #f9f9f9;
+                            }
+                            canvas {
+                                max-width: 400px;
+                                margin: 20px 0;
+                            }
+                        </style>
+                    </head>
+                    <body>
+                        <h1>Kubernetes Cluster Report</h1>
+                        <div class="section">
+                            <h2>Cluster Capacity</h2>
+                            <table>
+                                <tr><th>Metric</th><th>Value</th></tr>
+                                <tr><td>Total Pods Allocatable</td><td>${totalPods}</td></tr>
+                                <tr><td>Total Services Allocatable</td><td>${totalServices}</td></tr>
+                                <tr><td>Total CPU Available</td><td>${totalCPU}</td></tr>
+                                <tr><td>Total Memory Available</td><td>${totalMemory}</td></tr>
+                            </table>
+                        </div>
+                        <div class="section">
+                            <h2>Management Services Capacity</h2>
+                            <table>
+                                <tr><th>Metric</th><th>Value</th></tr>
+                                <tr><td>Management Pods Running</td><td>${mgmtPods}</td></tr>
+                                <tr><td>Management Services Running</td><td>${mgmtServices}</td></tr>
+                                <tr><td>Management CPU Requests</td><td>${mgmtCPURequests}</td></tr>
+                                <tr><td>Management Memory Requests</td><td>${mgmtMemoryRequests}</td></tr>
+                                <tr><td>Management CPU Limits</td><td>${mgmtCPULimits}</td></tr>
+                                <tr><td>Management Memory Limits</td><td>${mgmtMemoryLimits}</td></tr>
+                            </table>
+                        </div>
+                        <div class="section">
+                            <h2>Resource Quota Required</h2>
+                            <table>
+                                <tr><th>Metric</th><th>Value</th></tr>
+                                <tr><td>Resource Quota Pods Required</td><td>${quotaPods}</td></tr>
+                                <tr><td>Resource Quota Services Required</td><td>${quotaServices}</td></tr>
+                                <tr><td>Resource Quota CPU Requests</td><td>${quotaCPURequests}</td></tr>
+                                <tr><td>Resource Quota Memory Requests</td><td>${quotaMemoryRequests}</td></tr>
+                                <tr><td>Resource Quota CPU Limits</td><td>${quotaCPULimits}</td></tr>
+                                <tr><td>Resource Quota Memory Limits</td><td>${quotaMemoryLimits}</td></tr>
+                            </table>
+                        </div>
+                        <div class="section">
+                            <h2>Available Capacity</h2>
+                            <table>
+                                <tr><th>Metric</th><th>Value</th></tr>
+                                <tr><td>Available Capacity - Pods</td><td>${availablePods}</td></tr>
+                                <tr><td>Available Capacity - Services</td><td>${availableServices}</td></tr>
+                                <tr><td>Available CPU</td><td>${availableCPU}</td></tr>
+                                <tr><td>Available Memory</td><td>${availableMemory}</td></tr>
+                            </table>
+                        </div>
+                        <div class="section">
+                            <h2>Soft Limits</h2>
+                            <table>
+                                <tr><th>Metric</th><th>Value</th></tr>
+                                <tr><td>Soft Limit CPU</td><td>${softLimitCPU}</td></tr>
+                                <tr><td>Soft Limit Memory</td><td>${softLimitMemory}</td></tr>
+                            </table>
+                        </div>
+                        <div class="section">
+                            <h2>Available Capacity Visualization</h2>
+                            <canvas id="capacityChart"></canvas>
+                            <script>
+                                const ctx = document.getElementById('capacityChart').getContext('2d');
+                                new Chart(ctx, {
+                                    type: 'bar',
+                                    data: {
+                                        labels: ['Pods', 'Services', 'CPU', 'Memory'],
+                                        datasets: [{
+                                            label: 'Available Capacity',
+                                            data: [${availablePods}, ${availableServices}, ${availableCPU}, ${availableMemory}],
+                                            backgroundColor: ['#36A2EB', '#FF6384', '#FFCE56', '#4BC0C0'],
+                                            borderColor: ['#2A87D0', '#E7576C', '#E3B23C', '#3AA8A8'],
+                                            borderWidth: 1
+                                        }]
+                                    },
+                                    options: {
+                                        responsive: true,
+                                        scales: {
+                                            y: {
+                                                beginAtZero: true,
+                                                title: {
+                                                    display: true,
+                                                    text: 'Value'
+                                                }
+                                            },
+                                            x: {
+                                                title: {
+                                                    display: true,
+                                                    text: 'Resource'
+                                                }
+                                            }
+                                        },
+                                        plugins: {
+                                            legend: {
+                                                display: true,
+                                                position: 'top'
+                                            }
+                                        }
+                                    }
+                                });
+                            </script>
+                        </div>
+                    </body>
+                    </html>
+                    """
+
+                    // Write to file
+                    writeFile file: 'k8s_report.html', text: htmlContent
+                }
+            }
+        }
+        stage('Publish Report') {
+            steps {
+                publishHTML(target: [
+                    reportDir: '.',
+                    reportFiles: 'k8s_report.html',
+                    reportName: 'Kubernetes Cluster Report',
+                    keepAll: true,
+                    alwaysLinkToLastBuild: true,
+                    allowMissing: false
+                ])
+            }
+        }
+    }
+    post {
+        always {
+            archiveArtifacts artifacts: 'k8s_report.html', allowEmptyArchive: true
+        }
+    }
+}p
