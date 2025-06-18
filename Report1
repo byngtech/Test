@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kubernetes Metrics Dashboard</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    <style>
+        body {
+            font-family: 'Arial', sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
+            backdrop-filter: blur(10px);
+        }
+        
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+        
+        .header h1 {
+            color: #2c3e50;
+            font-size: 2.5em;
+            margin: 0;
+            font-weight: 300;
+            letter-spacing: -1px;
+        }
+        
+        .header p {
+            color: #7f8c8d;
+            font-size: 1.1em;
+            margin: 10px 0 0 0;
+        }
+        
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 30px;
+            margin-bottom: 30px;
+        }
+        
+        .metric-card {
+            background: white;
+            border-radius: 15px;
+            padding: 25px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+            border: 1px solid rgba(0, 0, 0, 0.05);
+        }
+        
+        .metric-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.12);
+        }
+        
+        .metric-title {
+            text-align: center;
+            margin-bottom: 20px;
+            font-size: 1.4em;
+            font-weight: 600;
+            color: #2c3e50;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        .chart-container {
+            position: relative;
+            height: 300px;
+            margin-bottom: 20px;
+        }
+        
+        .legend {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            flex-wrap: wrap;
+            margin-top: 15px;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.9em;
+            color: #555;
+        }
+        
+        .legend-color {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+        
+        .data-input-section {
+            background: #f8f9fa;
+            border-radius: 15px;
+            padding: 25px;
+            margin-top: 30px;
+        }
+        
+        .input-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .input-group {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.05);
+        }
+        
+        .input-group h3 {
+            margin: 0 0 15px 0;
+            color: #2c3e50;
+            font-size: 1.2em;
+            text-align: center;
+        }
+        
+        .input-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        
+        .input-row label {
+            font-weight: 500;
+            color: #555;
+            flex: 1;
+        }
+        
+        .input-row input {
+            width: 80px;
+            padding: 8px;
+            border: 2px solid #e0e0e0;
+            border-radius: 5px;
+            text-align: center;
+            font-size: 14px;
+            transition: border-color 0.3s ease;
+        }
+        
+        .input-row input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .update-btn {
+            display: block;
+            width: 200px;
+            margin: 20px auto 0;
+            padding: 12px 24px;
+            background: linear-gradient(45deg, #667eea, #764ba2);
+            color: white;
+            border: none;
+            border-radius: 25px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+        
+        .update-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.3);
+        }
+        
+        @media (max-width: 768px) {
+            .container {
+                padding: 20px;
+            }
+            
+            .header h1 {
+                font-size: 2em;
+            }
+            
+            .metrics-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .legend {
+                gap: 10px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Kubernetes Metrics Dashboard</h1>
+            <p>Resource allocation and utilization overview</p>
+        </div>
+        
+        <div class="metrics-grid">
+            <div class="metric-card">
+                <div class="metric-title">IP Addresses</div>
+                <div class="chart-container">
+                    <canvas id="ipChart"></canvas>
+                </div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-title">Services</div>
+                <div class="chart-container">
+                    <canvas id="servicesChart"></canvas>
+                </div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-title">CPU Usage</div>
+                <div class="chart-container">
+                    <canvas id="cpuChart"></canvas>
+                </div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-title">Memory Usage</div>
+                <div class="chart-container">
+                    <canvas id="memChart"></canvas>
+                </div>
+            </div>
+        </div>
+        
+        <div class="data-input-section">
+            <h2 style="text-align: center; margin-bottom: 25px; color: #2c3e50;">Update Metrics Data</h2>
+            
+            <div class="input-grid">
+                <div class="input-group">
+                    <h3>IP Addresses</h3>
+                    <div class="input-row">
+                        <label>Total Capacity:</label>
+                        <input type="number" id="ip-total" value="100">
+                    </div>
+                    <div class="input-row">
+                        <label>Management:</label>
+                        <input type="number" id="ip-management" value="30">
+                    </div>
+                    <div class="input-row">
+                        <label>Application:</label>
+                        <input type="number" id="ip-application" value="50">
+                    </div>
+                    <div class="input-row">
+                        <label>Available:</label>
+                        <input type="number" id="ip-available" value="20">
+                    </div>
+                </div>
+                
+                <div class="input-group">
+                    <h3>Services</h3>
+                    <div class="input-row">
+                        <label>Total Capacity:</label>
+                        <input type="number" id="services-total" value="200">
+                    </div>
+                    <div class="input-row">
+                        <label>Management:</label>
+                        <input type="number" id="services-management" value="60">
+                    </div>
+                    <div class="input-row">
+                        <label>Application:</label>
+                        <input type="number" id="services-application" value="100">
+                    </div>
+                    <div class="input-row">
+                        <label>Available:</label>
+                        <input type="number" id="services-available" value="40">
+                    </div>
+                </div>
+                
+                <div class="input-group">
+                    <h3>CPU (cores)</h3>
+                    <div class="input-row">
+                        <label>Total Capacity:</label>
+                        <input type="number" id="cpu-total" value="64">
+                    </div>
+                    <div class="input-row">
+                        <label>Management:</label>
+                        <input type="number" id="cpu-management" value="16">
+                    </div>
+                    <div class="input-row">
+                        <label>Application:</label>
+                        <input type="number" id="cpu-application" value="32">
+                    </div>
+                    <div class="input-row">
+                        <label>Available:</label>
+                        <input type="number" id="cpu-available" value="16">
+                    </div>
+                </div>
+                
+                <div class="input-group">
+                    <h3>Memory (GB)</h3>
+                    <div class="input-row">
+                        <label>Total Capacity:</label>
+                        <input type="number" id="mem-total" value="256">
+                    </div>
+                    <div class="input-row">
+                        <label>Management:</label>
+                        <input type="number" id="mem-management" value="64">
+                    </div>
+                    <div class="input-row">
+                        <label>Application:</label>
+                        <input type="number" id="mem-application" value="128">
+                    </div>
+                    <div class="input-row">
+                        <label>Available:</label>
+                        <input type="number" id="mem-available" value="64">
+                    </div>
+                </div>
+            </div>
+            
+            <button class="update-btn" onclick="updateCharts()">Update Charts</button>
+        </div>
+    </div>
+
+    <script>
+        // Chart configuration
+        const chartConfig = {
+            type: 'pie',
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        display: false
+                    },
+                    tooltip: {
+                        callbacks: {
+                            label: function(context) {
+                                const label = context.label || '';
+                                const value = context.parsed || 0;
+                                const percentage = ((value / context.dataset.data.reduce((a, b) => a + b, 0)) * 100).toFixed(1);
+                                return `${label}: ${value} (${percentage}%)`;
+                            }
+                        }
+                    }
+                },
+                animation: {
+                    animateRotate: true,
+                    duration: 1000
+                }
+            }
+        };
+
+        // Color scheme
+        const colors = {
+            management: '#e74c3c',
+            application: '#3498db',
+            available: '#2ecc71'
+        };
+
+        // Initialize charts
+        let charts = {};
+
+        function createChart(canvasId, data) {
+            const ctx = document.getElementById(canvasId).getContext('2d');
+            
+            const config = {
+                ...chartConfig,
+                data: {
+                    labels: ['Management', 'Application', 'Available'],
+                    datasets: [{
+                        data: data,
+                        backgroundColor: [colors.management, colors.application, colors.available],
+                        borderWidth: 3,
+                        borderColor: '#fff',
+                        hoverBorderWidth: 5,
+                        hoverBorderColor: '#fff'
+                    }]
+                }
+            };
+            
+            return new Chart(ctx, config);
+        }
+
+        function getDataFromInputs(metric) {
+            const total = parseFloat(document.getElementById(`${metric}-total`).value) || 0;
+            const management = parseFloat(document.getElementById(`${metric}-management`).value) || 0;
+            const application = parseFloat(document.getElementById(`${metric}-application`).value) || 0;
+            const available = parseFloat(document.getElementById(`${metric}-available`).value) || 0;
+            
+            return [management, application, available];
+        }
+
+        function updateCharts() {
+            const metrics = ['ip', 'services', 'cpu', 'mem'];
+            const chartIds = ['ipChart', 'servicesChart', 'cpuChart', 'memChart'];
+            
+            metrics.forEach((metric, index) => {
+                const data = getDataFromInputs(metric);
+                
+                if (charts[chartIds[index]]) {
+                    charts[chartIds[index]].data.datasets[0].data = data;
+                    charts[chartIds[index]].update('active');
+                } else {
+                    charts[chartIds[index]] = createChart(chartIds[index], data);
+                }
+            });
+        }
+
+        // Initialize charts on page load
+        window.addEventListener('load', function() {
+            updateCharts();
+        });
+
+        // Add input validation
+        document.querySelectorAll('input[type="number"]').forEach(input => {
+            input.addEventListener('change', function() {
+                if (this.value < 0) this.value = 0;
+            });
+        });
+    </script>
+</body>
+</html>
