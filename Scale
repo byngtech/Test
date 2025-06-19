@@ -1,0 +1,22 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: scale-up-workday
+  namespace: your-namespace
+spec:
+  schedule: "0 9 * * 1-5"  # 9 AM, Monday-Friday
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: pod-scaler
+          containers:
+          - name: kubectl
+            image: bitnami/kubectl:latest
+            command:
+            - /bin/sh
+            - -c
+            - |
+              kubectl scale deployment your-app --replicas=3
+              kubectl autoscale deployment your-app --cpu-percent=70 --min=2 --max=10
+          restartPolicy: OnFailure
