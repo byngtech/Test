@@ -1,0 +1,407 @@
+pipeline {
+    agent {
+        kubernetes {
+            yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    jenkins: worker
+spec:
+  containers:
+  - name: helm
+    image: alpine/helm:3.12.0
+    command:
+    - cat
+    tty: true
+    volumeMounts:
+    - name: docker-sock
+      mountPath: /var/run/docker.sock
+  - name: conftest
+    image: openpolicyagent/conftest:v0.46.0
+    command:
+    - cat
+    tty: true
+  - name: git
+    image: alpine/git:latest
+    command:
+    - cat
+    tty: true
+  volumes:
+  - name: docker-sock
+    hostPath:
+      path: /var/run/docker.sock
+"""
+        }
+    }
+    
+    parameters {
+        string(name: 'CHART_REPOS', defaultValue: '', description: 'Comma-separated list of chart repositories (repo1:branch1,repo2:branch2)')
+        string(name: 'CHART_CONFIGS', defaultValue: '', description: 'JSON string with chart configurations')
+        booleanParam(name: 'FAIL_ON_POLICY_VIOLATION', defaultValue: true, description: 'Fail build on policy violations')
+        booleanParam(name: 'SKIP_POLICY_CHECK', defaultValue: false, description: 'Skip policy validation')
+    }
+    
+    environment {
+        POLICY_REPO = 'https://github.com/your-org/helm-policies.git'
+        POLICY_BRANCH = 'main'
+        WORKSPACE_CHARTS = "${WORKSPACE}/charts"
+        WORKSPACE_POLICIES = "${WORKSPACE}/policies"
+        CONFTEST_OUTPUT = "${WORKSPACE}/conftest-results"
+    }
+    
+    stages {
+        stage('Checkout Policies') {
+            steps {
+                container('git') {
+                    script {
+                        sh """
+                            mkdir -p ${WORKSPACE_POLICIES}
+                            cd ${WORKSPACE_POLICIES}
+                            git clone -b ${POLICY_BRANCH} ${POLICY_REPO} .
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Checkout Chart Repositories') {
+            steps {
+                container('git') {
+                    script {
+                        sh "mkdir -p ${WORKSPACE_CHARTS}"
+                        
+                        // Parse chart configurations
+                        def chartConfigs = []
+                        
+                        if (params.CHART_REPOS) {
+                            // Simple format: repo1:branch1,repo2:branch2
+                            params.CHART_REPOS.split(',').each { repoConfig ->
+                                def parts = repoConfig.split(':')
+                                chartConfigs.add([
+                                    repo: parts[0],
+                                    branch: parts.length > 1 ? parts[1] : 'main',
+                                    path: '.',
+                                    name: parts[0].split('/').last().replace('.git', '')
+                                ])
+                            }
+                        }
+                        
+                        if (params.CHART_CONFIGS) {
+                            // JSON format for more complex configurations
+                            def jsonConfigs = readJSON text: params.CHART_CONFIGS
+                            chartConfigs.addAll(jsonConfigs)
+                        }
+                        
+                        // Default fallback if no parameters provided
+                        if (chartConfigs.isEmpty()) {
+                            chartConfigs = [
+                                [
+                                    repo: 'https://github.com/your-org/app1-helm.git',
+                                    branch: 'main',
+                                    path: '.',
+                                    name: 'app1'
+                                ],
+                                [
+                                    repo: 'https://github.com/your-org/app2-helm.git',
+                                    branch: 'develop',
+                                    path: 'charts/app2',
+                                    name: 'app2'
+                                ]
+                            ]
+                        }
+                        
+                        // Clone each chart repository
+                        chartConfigs.each { config ->
+                            echo "Cloning chart: ${config.name} from ${config.repo}:${config.branch}"
+                            sh """
+                                cd ${WORKSPACE_CHARTS}
+                                git clone -b ${config.branch} ${config.repo} ${config.name}
+                            """
+                        }
+                        
+                        // Store chart configs for later stages
+                        writeJSON file: 'chart-configs.json', json: chartConfigs
+                    }
+                }
+            }
+        }
+        
+        stage('Helm Dependencies') {
+            steps {
+                container('helm') {
+                    script {
+                        def chartConfigs = readJSON file: 'chart-configs.json'
+                        
+                        chartConfigs.each { config ->
+                            def chartPath = "${WORKSPACE_CHARTS}/${config.name}/${config.path}"
+                            echo "Processing dependencies for: ${config.name}"
+                            
+                            sh """
+                                cd ${chartPath}
+                                if [ -f Chart.yaml ]; then
+                                    if grep -q "dependencies:" Chart.yaml; then
+                                        echo "Found dependencies in ${config.name}, updating..."
+                                        helm dependency update
+                                    else
+                                        echo "No dependencies found in ${config.name}"
+                                    fi
+                                else
+                                    echo "No Chart.yaml found in ${chartPath}"
+                                fi
+                            """
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Helm Template & Policy Check') {
+            when {
+                not { params.SKIP_POLICY_CHECK }
+            }
+            steps {
+                script {
+                    def chartConfigs = readJSON file: 'chart-configs.json'
+                    def policyFailures = []
+                    def policyWarnings = []
+                    
+                    sh "mkdir -p ${CONFTEST_OUTPUT}"
+                    
+                    chartConfigs.each { config ->
+                        def chartPath = "${WORKSPACE_CHARTS}/${config.name}/${config.path}"
+                        def chartName = config.name
+                        
+                        echo "Processing chart: ${chartName} from ${chartPath}"
+                        
+                        container('helm') {
+                            // Template the chart with different value files
+                            sh """
+                                cd ${chartPath}
+                                mkdir -p ${CONFTEST_OUTPUT}/${chartName}
+                                
+                                # Template with default values
+                                if [ -f Chart.yaml ]; then
+                                    helm template ${chartName} . --output-dir ${CONFTEST_OUTPUT}/${chartName}/default
+                                    
+                                    # Template with environment-specific values if they exist
+                                    for env in dev staging prod; do
+                                        if [ -f values-\${env}.yaml ]; then
+                                            echo "Templating ${chartName} with values-\${env}.yaml"
+                                            helm template ${chartName}-\${env} . -f values-\${env}.yaml --output-dir ${CONFTEST_OUTPUT}/${chartName}/\${env}
+                                        fi
+                                    done
+                                else
+                                    echo "No Chart.yaml found in ${chartPath}"
+                                fi
+                            """
+                        }
+                        
+                        container('conftest') {
+                            // Run Conftest policy checks
+                            def conftest_result = sh(
+                                script: """
+                                    cd ${CONFTEST_OUTPUT}/${chartName}
+                                    
+                                    # Initialize result tracking
+                                    echo "0" > violation_count.txt
+                                    echo "0" > warning_count.txt
+                                    
+                                    # Run conftest on all templated YAML files
+                                    find . -name "*.yaml" -type f | while read yaml_file; do
+                                        echo "Checking policy for: \$yaml_file"
+                                        
+                                        # Run conftest and capture results
+                                        conftest test "\$yaml_file" --policy ${WORKSPACE_POLICIES} --output json > "\${yaml_file}.policy-result.json" 2>&1 || true
+                                        
+                                        # Parse results
+                                        if [ -f "\${yaml_file}.policy-result.json" ]; then
+                                            violations=\$(cat "\${yaml_file}.policy-result.json" | jq -r '.[0].failures | length' 2>/dev/null || echo "0")
+                                            warnings=\$(cat "\${yaml_file}.policy-result.json" | jq -r '.[0].warnings | length' 2>/dev/null || echo "0")
+                                            
+                                            if [ "\$violations" -gt 0 ]; then
+                                                echo "Policy violations found in \$yaml_file:"
+                                                cat "\${yaml_file}.policy-result.json" | jq -r '.[0].failures[] | .msg' 2>/dev/null || echo "Failed to parse violations"
+                                                current_count=\$(cat violation_count.txt)
+                                                echo \$((current_count + violations)) > violation_count.txt
+                                            fi
+                                            
+                                            if [ "\$warnings" -gt 0 ]; then
+                                                echo "Policy warnings found in \$yaml_file:"
+                                                cat "\${yaml_file}.policy-result.json" | jq -r '.[0].warnings[] | .msg' 2>/dev/null || echo "Failed to parse warnings"
+                                                current_count=\$(cat warning_count.txt)
+                                                echo \$((current_count + warnings)) > warning_count.txt
+                                            fi
+                                        fi
+                                    done
+                                    
+                                    # Check final counts
+                                    total_violations=\$(cat violation_count.txt)
+                                    total_warnings=\$(cat warning_count.txt)
+                                    
+                                    echo "Chart ${chartName} - Violations: \$total_violations, Warnings: \$total_warnings"
+                                    
+                                    # Create summary report
+                                    echo "{\\"chart\\": \\"${chartName}\\", \\"violations\\": \$total_violations, \\"warnings\\": \$total_warnings}" > summary.json
+                                    
+                                    # Exit with error if violations found
+                                    if [ "\$total_violations" -gt 0 ]; then
+                                        exit 1
+                                    fi
+                                """,
+                                returnStatus: true
+                            )
+                            
+                            // Read summary
+                            def summary = readJSON file: "${CONFTEST_OUTPUT}/${chartName}/summary.json"
+                            
+                            if (conftest_result != 0 || summary.violations > 0) {
+                                policyFailures.add([
+                                    chart: chartName,
+                                    violations: summary.violations,
+                                    warnings: summary.warnings
+                                ])
+                                echo "❌ Policy check FAILED for chart: ${chartName} (${summary.violations} violations, ${summary.warnings} warnings)"
+                            } else {
+                                echo "✅ Policy check PASSED for chart: ${chartName} (${summary.warnings} warnings)"
+                                if (summary.warnings > 0) {
+                                    policyWarnings.add([
+                                        chart: chartName,
+                                        warnings: summary.warnings
+                                    ])
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Archive results
+                    archiveArtifacts artifacts: 'conftest-results/**/*.json', allowEmptyArchive: true
+                    
+                    // Create summary report
+                    def summaryReport = [
+                        total_charts: chartConfigs.size(),
+                        failed_charts: policyFailures.size(),
+                        charts_with_warnings: policyWarnings.size(),
+                        failures: policyFailures,
+                        warnings: policyWarnings
+                    ]
+                    
+                    writeJSON file: 'policy-summary.json', json: summaryReport
+                    archiveArtifacts artifacts: 'policy-summary.json'
+                    
+                    // Display summary
+                    echo "\\n=== POLICY CHECK SUMMARY ==="
+                    echo "Total Charts: ${summaryReport.total_charts}"
+                    echo "Failed Charts: ${summaryReport.failed_charts}"
+                    echo "Charts with Warnings: ${summaryReport.charts_with_warnings}"
+                    
+                    if (policyFailures.size() > 0) {
+                        echo "\\n❌ FAILED CHARTS:"
+                        policyFailures.each { failure ->
+                            echo "  - ${failure.chart}: ${failure.violations} violations, ${failure.warnings} warnings"
+                        }
+                    }
+                    
+                    if (policyWarnings.size() > 0) {
+                        echo "\\n⚠️  CHARTS WITH WARNINGS:"
+                        policyWarnings.each { warning ->
+                            echo "  - ${warning.chart}: ${warning.warnings} warnings"
+                        }
+                    }
+                    
+                    // Fail the build if policy failures and parameter is set
+                    if (policyFailures.size() > 0 && params.FAIL_ON_POLICY_VIOLATION) {
+                        def failedCharts = policyFailures.collect { it.chart }.join(', ')
+                        error "❌ Policy validation failed for charts: ${failedCharts}"
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy Charts') {
+            when {
+                anyOf {
+                    params.SKIP_POLICY_CHECK
+                    expression { 
+                        // Only deploy if no policy failures or policy check is not configured to fail build
+                        return !params.FAIL_ON_POLICY_VIOLATION || (currentBuild.result == null || currentBuild.result == 'SUCCESS')
+                    }
+                }
+            }
+            steps {
+                container('helm') {
+                    script {
+                        def chartConfigs = readJSON file: 'chart-configs.json'
+                        
+                        chartConfigs.each { config ->
+                            def chartPath = "${WORKSPACE_CHARTS}/${config.name}/${config.path}"
+                            def chartName = config.name
+                            
+                            echo "Deploying chart: ${chartName}"
+                            
+                            // Add your deployment logic here
+                            sh """
+                                cd ${chartPath}
+                                
+                                # Example deployment commands
+                                # Modify these based on your deployment strategy
+                                
+                                # Deploy to staging
+                                if [ -f values-staging.yaml ]; then
+                                    echo "Deploying ${chartName} to staging..."
+                                    # helm upgrade --install ${chartName}-staging . -f values-staging.yaml --namespace staging-${chartName} --create-namespace
+                                fi
+                                
+                                # Deploy to production (example with approval)
+                                if [ -f values-prod.yaml ]; then
+                                    echo "Ready to deploy ${chartName} to production..."
+                                    # Add manual approval step or conditional logic here
+                                fi
+                            """
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            // Clean up workspace
+            sh '''
+                rm -rf ${WORKSPACE_CHARTS}
+                rm -rf ${WORKSPACE_POLICIES}
+                rm -rf ${CONFTEST_OUTPUT}
+                rm -f chart-configs.json
+            '''
+        }
+        failure {
+            script {
+                if (fileExists('policy-summary.json')) {
+                    def summary = readJSON file: 'policy-summary.json'
+                    if (summary.failed_charts > 0) {
+                        echo "❌ Build failed due to policy violations. Check archived artifacts for details."
+                        
+                        // Optional: Send notification
+                        // slackSend(
+                        //     color: 'danger',
+                        //     message: "Policy check failed for ${summary.failed_charts} charts. Check build artifacts for details."
+                        // )
+                    }
+                }
+            }
+        }
+        success {
+            script {
+                if (fileExists('policy-summary.json')) {
+                    def summary = readJSON file: 'policy-summary.json'
+                    echo "✅ All ${summary.total_charts} charts passed policy validation!"
+                    
+                    if (summary.charts_with_warnings > 0) {
+                        echo "⚠️  ${summary.charts_with_warnings} charts have warnings - please review"
+                    }
+                }
+            }
+        }
+    }
+}
