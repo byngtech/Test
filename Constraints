@@ -1,0 +1,291 @@
+# ============================================================================
+# 1. CMDB ID Label Requirement
+# ============================================================================
+
+# ConstraintTemplate for requiring cmdb_id label
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredcmdbid
+  annotations:
+    description: "Requires cmdb_id label on workloads for cost tracking"
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredCmdbId
+      validation:
+        properties:
+          message:
+            type: string
+            description: "Custom violation message"
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequiredcmdbid
+        
+        violation[{"msg": msg}] {
+          # Check if cmdb_id label exists and is not empty
+          not input.review.object.metadata.labels.cmdb_id
+          msg := sprintf("Resource %v/%v is missing required 'cmdb_id' label for cost tracking", [input.review.object.kind, input.review.object.metadata.name])
+        }
+        
+        violation[{"msg": msg}] {
+          # Check if cmdb_id label is empty
+          input.review.object.metadata.labels.cmdb_id == ""
+          msg := sprintf("Resource %v/%v has empty 'cmdb_id' label - must contain a valid cost center ID", [input.review.object.kind, input.review.object.metadata.name])
+        }
+
+---
+# Constraint for CMDB ID requirement
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredCmdbId
+metadata:
+  name: require-cmdb-id-label
+  annotations:
+    description: "Enforce cmdb_id label on all workloads"
+spec:
+  enforcementAction: warn  # Start with warn, then change to deny after validation
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds: ["Deployment", "StatefulSet"]
+      - apiGroups: ["batch"]
+        kinds: ["Job"]
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    excludedNamespaces: ["kube-system", "kube-public", "gatekeeper-system"]
+  parameters:
+    message: "All workloads must have a cmdb_id label for cost allocation"
+
+---
+
+# ============================================================================
+# 2. Container Resource Requirements
+# ============================================================================
+
+# ConstraintTemplate for requiring container resources
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8scontainerresources
+  annotations:
+    description: "Requires resource requests and limits on all containers"
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sContainerResources
+      validation:
+        properties:
+          exemptContainers:
+            type: array
+            description: "List of container names to exempt from this policy"
+            items:
+              type: string
+          exemptImages:
+            type: array
+            description: "List of image patterns to exempt from this policy"
+            items:
+              type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8scontainerresources
+        
+        # Get containers from different resource types
+        get_containers[container] {
+          input.review.object.spec.containers[_] = container
+        }
+        
+        get_containers[container] {
+          input.review.object.spec.template.spec.containers[_] = container
+        }
+        
+        get_containers[container] {
+          input.review.object.spec.jobTemplate.spec.template.spec.containers[_] = container
+        }
+        
+        # Check if container is exempt by name
+        is_exempt_container(container_name) {
+          exempt_containers := input.parameters.exemptContainers
+          exempt_containers[_] == container_name
+        }
+        
+        # Check if container is exempt by image pattern
+        is_exempt_image(image) {
+          exempt_images := input.parameters.exemptImages
+          startswith(image, exempt_images[_])
+        }
+        
+        violation[{"msg": msg}] {
+          container := get_containers[_]
+          not is_exempt_container(container.name)
+          not is_exempt_image(container.image)
+          
+          # Check CPU requests
+          not container.resources.requests.cpu
+          msg := sprintf("Container '%v' is missing CPU requests. All containers must specify resource requests and limits.", [container.name])
+        }
+        
+        violation[{"msg": msg}] {
+          container := get_containers[_]
+          not is_exempt_container(container.name)
+          not is_exempt_image(container.image)
+          
+          # Check memory requests
+          not container.resources.requests.memory
+          msg := sprintf("Container '%v' is missing memory requests. All containers must specify resource requests and limits.", [container.name])
+        }
+        
+        violation[{"msg": msg}] {
+          container := get_containers[_]
+          not is_exempt_container(container.name)
+          not is_exempt_image(container.image)
+          
+          # Check CPU limits
+          not container.resources.limits.cpu
+          msg := sprintf("Container '%v' is missing CPU limits. All containers must specify resource requests and limits.", [container.name])
+        }
+        
+        violation[{"msg": msg}] {
+          container := get_containers[_]
+          not is_exempt_container(container.name)
+          not is_exempt_image(container.image)
+          
+          # Check memory limits
+          not container.resources.limits.memory
+          msg := sprintf("Container '%v' is missing memory limits. All containers must specify resource requests and limits.", [container.name])
+        }
+
+---
+# Constraint for container resources
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sContainerResources
+metadata:
+  name: require-container-resources
+  annotations:
+    description: "Enforce resource requests and limits on all containers"
+spec:
+  enforcementAction: warn  # Start with warn, then change to deny after validation
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds: ["Deployment", "StatefulSet"]
+      - apiGroups: ["batch"]
+        kinds: ["Job", "CronJob"]
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    excludedNamespaces: ["kube-system", "kube-public", "gatekeeper-system"]
+  parameters:
+    # Optional: Exempt specific containers or images from this policy
+    exemptContainers: []  # e.g., ["istio-proxy", "linkerd-proxy"]
+    exemptImages: []      # e.g., ["gcr.io/istio-release/", "cr.l5d.io/linkerd/"]
+
+---
+
+# ============================================================================
+# 3. Deployment Strategy Restriction
+# ============================================================================
+
+# ConstraintTemplate for blocking Recreate deployment strategy
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8sdeploymentstrategy
+  annotations:
+    description: "Prevents use of Recreate deployment strategy"
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sDeploymentStrategy
+      validation:
+        properties:
+          allowedStrategies:
+            type: array
+            description: "List of allowed deployment strategies"
+            items:
+              type: string
+          message:
+            type: string
+            description: "Custom violation message"
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8sdeploymentstrategy
+        
+        violation[{"msg": msg}] {
+          # Only apply to Deployments
+          input.review.object.kind == "Deployment"
+          
+          # Check if strategy is explicitly set to Recreate
+          input.review.object.spec.strategy.type == "Recreate"
+          
+          allowed_strategies := input.parameters.allowedStrategies
+          not allowed_strategies[_] == "Recreate"
+          
+          msg := sprintf("Deployment '%v' uses 'Recreate' strategy which is not allowed. Use 'RollingUpdate' strategy instead to ensure zero-downtime deployments.", [input.review.object.metadata.name])
+        }
+        
+        violation[{"msg": msg}] {
+          # Only apply to Deployments
+          input.review.object.kind == "Deployment"
+          
+          # Handle case where strategy type might be in different case
+          strategy_type := input.review.object.spec.strategy.type
+          lower(strategy_type) == "recreate"
+          
+          allowed_strategies := input.parameters.allowedStrategies
+          not allowed_strategies[_] == "Recreate"
+          
+          msg := sprintf("Deployment '%v' uses '%v' strategy which is not allowed. Use 'RollingUpdate' strategy instead to ensure zero-downtime deployments.", [input.review.object.metadata.name, strategy_type])
+        }
+
+---
+# Constraint for deployment strategy
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sDeploymentStrategy
+metadata:
+  name: block-recreate-strategy
+  annotations:
+    description: "Block Recreate deployment strategy to ensure zero-downtime deployments"
+spec:
+  enforcementAction: warn  # Start with warn, then change to deny after validation
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds: ["Deployment"]
+    excludedNamespaces: ["kube-system", "kube-public", "gatekeeper-system"]
+  parameters:
+    allowedStrategies: ["RollingUpdate"]  # Only allow RollingUpdate strategy
+    message: "Recreate deployment strategy is not permitted in this environment"
+
+---
+
+# ============================================================================
+# OPTIONAL: Violation Monitoring
+# ============================================================================
+
+# You can also create a simple monitoring constraint to track violations
+# This would be useful for observability and compliance reporting
+
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredCmdbId
+metadata:
+  name: monitor-cmdb-violations
+  annotations:
+    description: "Monitor CMDB ID violations for reporting"
+spec:
+  enforcementAction: warn  # Just warn, don't block
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds: ["Deployment", "StatefulSet"]
+      - apiGroups: ["batch"]  
+        kinds: ["Job"]
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    excludedNamespaces: ["kube-system", "kube-public", "gatekeeper-system", "monitoring"]
+  parameters:
+    message: "COMPLIANCE MONITORING: Resource missing cmdb_id label"
