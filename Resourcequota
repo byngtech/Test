@@ -1,0 +1,291 @@
+# Kubernetes Resource Management Guide for Feature Teams
+
+## Overview
+
+This guide helps you understand how to properly request and limit CPU and memory resources in our Kubernetes clusters (BLD, INT, PRE, PROD) to ensure optimal performance and fair resource sharing.
+
+## Key Concepts
+
+### What are Resource Requests and Limits?
+
+**Resource Requests**: The minimum amount of CPU/memory your application needs to function
+
+- Used by Kubernetes scheduler to decide which node to place your pod
+- Your application is guaranteed this amount of resources
+
+**Resource Limits**: The maximum amount of CPU/memory your application can use
+
+- Prevents your application from consuming excessive cluster resources
+- Protects other applications from resource starvation
+
+### Resource Units
+
+**CPU**:
+
+- Measured in millicores (m) or cores
+- 1000m = 1 CPU core
+- Examples: 100m, 500m, 1, 2
+
+**Memory**:
+
+- Measured in bytes with suffixes: Mi (mebibytes), Gi (gibibytes)
+- Examples: 128Mi, 512Mi, 1Gi, 2Gi
+
+## Step-by-Step Resource Planning
+
+### Step 1: Understand Your Application Types
+
+#### Web Applications/APIs
+
+- **Typical CPU Request**: 100m - 500m per replica
+- **Typical CPU Limit**: 500m - 1 core per replica
+- **Typical Memory Request**: 256Mi - 512Mi per replica
+- **Typical Memory Limit**: 512Mi - 1Gi per replica
+
+#### Background Workers/Batch Jobs
+
+- **Typical CPU Request**: 200m - 1 core per job
+- **Typical CPU Limit**: 1 - 2 cores per job
+- **Typical Memory Request**: 512Mi - 2Gi per job
+- **Typical Memory Limit**: 1Gi - 4Gi per job
+
+#### Databases/Stateful Services
+
+- **Typical CPU Request**: 500m - 2 cores
+- **Typical CPU Limit**: 1 - 4 cores
+- **Typical Memory Request**: 1Gi - 8Gi
+- **Typical Memory Limit**: 2Gi - 16Gi
+
+### Step 2: Calculate Your Namespace Requirements
+
+Use this worksheet to calculate your total namespace resource quota:
+
+```
+Service Name: _______________
+Service Type: [Web App | Worker | Database | Other]
+Number of Replicas: _________
+
+Per Pod Resources:
+- CPU Request: _______ 
+- CPU Limit: _______
+- Memory Request: _______
+- Memory Limit: _______
+
+Total Namespace Calculation:
+- Total CPU Requests = (CPU Request per pod) × (Number of replicas) × (Number of services)
+- Total CPU Limits = (CPU Limit per pod) × (Number of replicas) × (Number of services)
+- Total Memory Requests = (Memory Request per pod) × (Number of replicas) × (Number of services)  
+- Total Memory Limits = (Memory Limit per pod) × (Number of replicas) × (Number of services)
+
+Add 20% buffer for scaling and overhead:
+- Final CPU Request Quota = Total CPU Requests × 1.2
+- Final CPU Limit Quota = Total CPU Limits × 1.2
+- Final Memory Request Quota = Total Memory Requests × 1.2
+- Final Memory Limit Quota = Total Memory Limits × 1.2
+```
+
+### Step 3: Environment-Specific Considerations
+
+#### Development (BLD)
+
+- Use smaller resource allocations (50-70% of production)
+- Focus on functionality over performance
+
+#### Integration (INT)
+
+- Use production-like resource allocations for realistic testing
+- Consider test data volume impact
+
+#### Pre-Production (PRE)
+
+- Mirror production resource allocations
+- Include load testing overhead
+
+#### Production (PROD)
+
+- Use full calculated resource allocations
+- Include auto-scaling headroom
+
+## Resource Configuration Examples
+
+### Example 1: Simple Web API
+
+```yaml
+# Deployment with proper resource configuration
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-web-api
+  namespace: my-team-namespace
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+      - name: web-api
+        image: my-app:latest
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi" 
+            cpu: "500m"
+```
+
+**Corresponding Resource Quota Calculation**:
+
+- CPU Requests: 100m × 3 replicas = 300m
+- CPU Limits: 500m × 3 replicas = 1500m (1.5 cores)
+- Memory Requests: 256Mi × 3 replicas = 768Mi
+- Memory Limits: 512Mi × 3 replicas = 1536Mi (1.5Gi)
+
+### Example 2: Background Worker
+
+```yaml
+# Job with appropriate resources for batch processing
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: data-processor
+  namespace: my-team-namespace
+spec:
+  template:
+    spec:
+      containers:
+      - name: processor
+        image: my-processor:latest
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1"
+```
+
+## Resource Quota Request Template
+
+When requesting namespace resource quotas, use this template:
+
+```yaml
+# Resource Quota Request for Namespace: [YOUR_NAMESPACE]
+# Cluster: [BLD/INT/PRE/PROD]
+
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: team-quota
+  namespace: [YOUR_NAMESPACE]
+spec:
+  hard:
+    requests.cpu: "[CALCULATED_CPU_REQUESTS]"
+    requests.memory: "[CALCULATED_MEMORY_REQUESTS]"
+    limits.cpu: "[CALCULATED_CPU_LIMITS]"
+    limits.memory: "[CALCULATED_MEMORY_LIMITS]"
+    count/deployments.apps: "[MAX_DEPLOYMENTS]"
+    count/services: "[MAX_SERVICES]"
+    count/configmaps: "[MAX_CONFIGMAPS]"
+    count/secrets: "[MAX_SECRETS]"
+```
+
+**Example Filled Template**:
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: payment-team-quota
+  namespace: payment-services
+spec:
+  hard:
+    requests.cpu: "2"        # 2000m
+    requests.memory: "4Gi"   # 4096Mi
+    limits.cpu: "6"          # 6000m  
+    limits.memory: "12Gi"    # 12288Mi
+    count/deployments.apps: "10"
+    count/services: "15"
+    count/configmaps: "20"
+    count/secrets: "10"
+```
+
+## Best Practices
+
+### 1. Right-Sizing Guidelines
+
+- **Requests should be conservative**: Set to what your app actually needs minimum
+- **Limits should allow headroom**: Set 50-100% higher than typical usage
+- **Monitor and adjust**: Review resource usage monthly and adjust accordingly
+
+### 2. Horizontal vs Vertical Scaling
+
+- **Prefer horizontal scaling**: Add more replicas rather than increasing per-pod resources
+- **Use HPA (Horizontal Pod Autoscaler)**: Automatically scale based on CPU/memory usage
+- **Set reasonable replica ranges**: Min 2-3 for high availability, max based on resource quotas
+
+### 3. Environment Parity
+
+- **Maintain ratios across environments**: If PROD uses X, PRE should use ~X, INT can use 0.7X, BLD can use 0.5X
+- **Test with realistic loads**: Ensure INT/PRE environments can handle expected traffic
+
+## Common Mistakes to Avoid
+
+❌ **Setting requests too high**: Wastes cluster capacity and prevents efficient scheduling
+❌ **Setting limits too low**: Causes applications to be killed (OOMKilled) under normal load  
+❌ **No limits at all**: Can starve other applications of resources
+❌ **Identical requests and limits**: Reduces scheduling flexibility
+❌ **Ignoring init containers**: They also need resource specifications
+❌ **Not considering seasonal traffic**: Plan for peak usage periods
+
+## Monitoring and Optimization
+
+### Key Metrics to Watch
+
+- **CPU Utilization**: Should be 60-80% of requests under normal load
+- **Memory Utilization**: Should be 70-90% of requests under normal load
+- **Pod Restart Rate**: High restarts may indicate resource constraints
+- **Scheduling Delays**: May indicate insufficient cluster capacity
+
+### Tools for Monitoring
+
+- Kubernetes Dashboard
+- Prometheus + Grafana
+- kubectl top commands
+- Your organization’s monitoring solution
+
+## Request Process
+
+1. **Calculate your requirements** using the worksheet above
+1. **Fill out the resource quota template**
+1. **Submit request** to platform team with:
+- Completed resource quota YAML
+- Business justification
+- Expected traffic patterns
+- Scaling requirements
+1. **Review and approval** by capacity management team
+1. **Implementation** in target clusters
+1. **Validation** that your applications deploy successfully
+
+## Getting Help
+
+- **Platform Team**: For quota approvals and cluster-level issues
+- **DevOps Channel**: For configuration and deployment questions
+- **Documentation**: Internal wiki and runbooks
+- **Office Hours**: Weekly sessions for resource planning help
+
+## Appendix: Resource Estimation Tools
+
+### Simple Calculator Formula
+
+```
+Total CPU Requests = Σ(replicas × cpu_request_per_pod) for all services
+Total Memory Requests = Σ(replicas × memory_request_per_pod) for all services
+Add 20% buffer for: Total × 1.2
+```
+
+### Load Testing Considerations
+
+- Run load tests in INT environment first
+- Monitor resource usage during peak synthetic load
+- Adjust PROD quotas based on load test results
+- Plan for 2-3x growth over next 12 months
