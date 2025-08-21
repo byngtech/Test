@@ -1,0 +1,530 @@
+# Kubernetes Resource Management Guide for Feature Teams
+
+## Overview
+
+This guide helps you understand how to properly request and limit CPU and memory resources in our Kubernetes clusters (BLD, INT, PRE, PROD) to ensure optimal performance and fair resource sharing.
+
+## Key Concepts
+
+### What are Resource Requests and Limits?
+
+**Resource Requests**: The minimum amount of CPU/memory your application needs to function
+
+- Used by Kubernetes scheduler to decide which node to place your pod
+- Your application is guaranteed this amount of resources
+
+**Resource Limits**: The maximum amount of CPU/memory your application can use
+
+- Prevents your application from consuming excessive cluster resources
+- Protects other applications from resource starvation
+
+### Resource Units
+
+**CPU**:
+
+- Measured in millicores (m) or cores
+- 1000m = 1 CPU core
+- Examples: 100m, 500m, 1, 2
+
+**Memory**:
+
+- Measured in bytes with suffixes: Mi (mebibytes), Gi (gibibytes)
+- Examples: 128Mi, 512Mi, 1Gi, 2Gi
+
+## Step-by-Step Resource Planning
+
+### Step 1: Understand Your Application Types
+
+#### Web Applications/APIs
+
+- **Typical CPU Request**: 100m - 500m per replica
+- **Typical CPU Limit**: 500m - 1 core per replica
+- **Typical Memory Request**: 256Mi - 512Mi per replica
+- **Typical Memory Limit**: 512Mi - 1Gi per replica
+
+#### Background Workers/Batch Jobs
+
+- **Typical CPU Request**: 200m - 1 core per job
+- **Typical CPU Limit**: 1 - 2 cores per job
+- **Typical Memory Request**: 512Mi - 2Gi per job
+- **Typical Memory Limit**: 1Gi - 4Gi per job
+
+#### Databases/Stateful Services
+
+- **Typical CPU Request**: 500m - 2 cores
+- **Typical CPU Limit**: 1 - 4 cores
+- **Typical Memory Request**: 1Gi - 8Gi
+- **Typical Memory Limit**: 2Gi - 16Gi
+
+### Step 2: Calculate Your Namespace Requirements
+
+Use this comprehensive worksheet to calculate your total namespace resource quota:
+
+#### Per-Service Calculation Worksheet
+
+**Service 1: _______________**
+
+```
+Service Type: [Web App | Worker | Database | Other]
+
+Scaling Configuration:
+□ Fixed Replicas: _____ replicas
+□ HPA Enabled: Min _____ replicas | Max _____ replicas
+
+Container Resources (list all containers in the pod):
+
+Main Container:
+- CPU Request: _______
+- CPU Limit: _______  
+- Memory Request: _______
+- Memory Limit: _______
+
+Sidecar Container 1 (if any): _______________
+- CPU Request: _______
+- CPU Limit: _______
+- Memory Request: _______
+- Memory Limit: _______
+
+Sidecar Container 2 (if any): _______________
+- CPU Request: _______
+- CPU Limit: _______
+- Memory Request: _______
+- Memory Limit: _______
+
+Init Container 1 (if any): _______________
+- CPU Request: _______
+- CPU Limit: _______
+- Memory Request: _______
+- Memory Limit: _______
+
+Per-Pod Total Resources:
+- Total Pod CPU Request = Sum of all container CPU requests
+- Total Pod CPU Limit = Sum of all container CPU limits  
+- Total Pod Memory Request = Sum of all container memory requests
+- Total Pod Memory Limit = Sum of all container memory limits
+
+Service-Level Calculation:
+For HPA-enabled services, use MAX replicas for quota calculation:
+- Service CPU Requests = (Total Pod CPU Request) × (Max Replicas)
+- Service CPU Limits = (Total Pod CPU Limit) × (Max Replicas)
+- Service Memory Requests = (Total Pod Memory Request) × (Max Replicas)
+- Service Memory Limits = (Total Pod Memory Limit) × (Max Replicas)
+```
+
+#### Complete Namespace Calculation
+
+**Repeat the above worksheet for each service, then sum totals:**
+
+```
+Total Namespace Resources (sum of all services):
+- Total CPU Requests = Sum of all service CPU requests
+- Total CPU Limits = Sum of all service CPU limits
+- Total Memory Requests = Sum of all service memory requests  
+- Total Memory Limits = Sum of all service memory limits
+
+Add buffers:
+- Emergency scaling buffer (20%): For unexpected load spikes
+- Platform overhead buffer (10%): For system containers, monitoring agents
+
+Final Namespace Quota Calculation:
+- Final CPU Request Quota = Total CPU Requests × 1.3 (30% total buffer)
+- Final CPU Limit Quota = Total CPU Limits × 1.3 (30% total buffer)
+- Final Memory Request Quota = Total Memory Requests × 1.3 (30% total buffer)  
+- Final Memory Limit Quota = Total Memory Limits × 1.3 (30% total buffer)
+```
+
+### Step 3: Environment-Specific Considerations
+
+#### Development (BLD)
+
+- Use smaller resource allocations (50-70% of production)
+- Focus on functionality over performance
+
+#### Integration (INT)
+
+- Use production-like resource allocations for realistic testing
+- Consider test data volume impact
+
+#### Pre-Production (PRE)
+
+- Mirror production resource allocations
+- Include load testing overhead
+
+#### Production (PROD)
+
+- Use full calculated resource allocations
+- Include auto-scaling headroom
+
+## Resource Configuration Examples
+
+### Example 1: Web API with HPA and Sidecar
+
+```yaml
+# Deployment with main container + istio sidecar + monitoring sidecar
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-web-api
+  namespace: my-team-namespace
+spec:
+  replicas: 3  # Initial replicas (HPA will manage scaling)
+  template:
+    spec:
+      containers:
+      # Main application container
+      - name: web-api
+        image: my-app:latest
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi" 
+            cpu: "500m"
+      
+      # Istio sidecar proxy (automatically injected)
+      - name: istio-proxy
+        image: istio/proxyv2:latest
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "50m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+      
+      # Monitoring/logging sidecar
+      - name: log-shipper
+        image: fluent-bit:latest
+        resources:
+          requests:
+            memory: "64Mi" 
+            cpu: "25m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+
+---
+# HPA Configuration
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: my-web-api-hpa
+  namespace: my-team-namespace
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-web-api
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+```
+
+**Resource Quota Calculation for this service**:
+
+```
+Per-Pod Resources:
+- Main container: 100m CPU req, 500m CPU limit, 256Mi mem req, 512Mi mem limit
+- Istio sidecar: 50m CPU req, 200m CPU limit, 128Mi mem req, 256Mi mem limit  
+- Log shipper: 25m CPU req, 100m CPU limit, 64Mi mem req, 128Mi mem limit
+
+Total Per-Pod:
+- CPU Requests: 100m + 50m + 25m = 175m
+- CPU Limits: 500m + 200m + 100m = 800m
+- Memory Requests: 256Mi + 128Mi + 64Mi = 448Mi
+- Memory Limits: 512Mi + 256Mi + 128Mi = 896Mi
+
+Service Total (using MAX replicas = 10):
+- CPU Requests: 175m × 10 = 1750m (1.75 cores)
+- CPU Limits: 800m × 10 = 8000m (8 cores)
+- Memory Requests: 448Mi × 10 = 4480Mi (~4.4Gi)
+- Memory Limits: 896Mi × 10 = 8960Mi (~8.8Gi)
+```
+
+### Example 2: Worker Service with Init Container
+
+```yaml
+# StatefulSet with init container for database migration
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: data-processor
+  namespace: my-team-namespace
+spec:
+  replicas: 2
+  template:
+    spec:
+      initContainers:
+      # Database migration init container
+      - name: db-migrate
+        image: my-migrator:latest
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+      
+      containers:
+      # Main processing container
+      - name: processor
+        image: my-processor:latest
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1"
+      
+      # Redis sidecar for caching
+      - name: redis-cache
+        image: redis:alpine
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "200m"
+
+---
+# HPA for the StatefulSet
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: data-processor-hpa
+  namespace: my-team-namespace
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: data-processor
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+```
+
+**Resource Quota Calculation for this service**:
+
+```
+Per-Pod Resources (running containers only - init containers don't count toward quota):
+- Main processor: 500m CPU req, 1000m CPU limit, 1Gi mem req, 2Gi mem limit
+- Redis sidecar: 100m CPU req, 200m CPU limit, 256Mi mem req, 512Mi mem limit
+
+Total Per-Pod (running containers):
+- CPU Requests: 500m + 100m = 600m
+- CPU Limits: 1000m + 200m = 1200m
+- Memory Requests: 1Gi + 256Mi = 1280Mi (~1.25Gi)
+- Memory Limits: 2Gi + 512Mi = 2560Mi (~2.5Gi)
+
+Service Total (using MAX replicas = 6):
+- CPU Requests: 600m × 6 = 3600m (3.6 cores)
+- CPU Limits: 1200m × 6 = 7200m (7.2 cores)
+- Memory Requests: 1280Mi × 6 = 7680Mi (~7.5Gi)
+- Memory Limits: 2560Mi × 6 = 15360Mi (~15Gi)
+```
+
+## Resource Quota Request Template
+
+When requesting namespace resource quotas, use this template:
+
+```yaml
+# Resource Quota Request for Namespace: [YOUR_NAMESPACE]
+# Cluster: [BLD/INT/PRE/PROD]
+
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: team-quota
+  namespace: [YOUR_NAMESPACE]
+spec:
+  hard:
+    requests.cpu: "[CALCULATED_CPU_REQUESTS]"
+    requests.memory: "[CALCULATED_MEMORY_REQUESTS]"
+    limits.cpu: "[CALCULATED_CPU_LIMITS]"
+    limits.memory: "[CALCULATED_MEMORY_LIMITS]"
+    count/deployments.apps: "[MAX_DEPLOYMENTS]"
+    count/services: "[MAX_SERVICES]"
+    count/configmaps: "[MAX_CONFIGMAPS]"
+    count/secrets: "[MAX_SECRETS]"
+```
+
+**Example Filled Template**:
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: payment-team-quota
+  namespace: payment-services
+spec:
+  hard:
+    requests.cpu: "2"        # 2000m
+    requests.memory: "4Gi"   # 4096Mi
+    limits.cpu: "6"          # 6000m  
+    limits.memory: "12Gi"    # 12288Mi
+    count/deployments.apps: "10"
+    count/services: "15"
+    count/configmaps: "20"
+    count/secrets: "10"
+```
+
+## Best Practices
+
+### 1. Right-Sizing Guidelines
+
+- **Requests should be conservative**: Set to what your app actually needs minimum
+- **Limits should allow headroom**: Set 50-100% higher than typical usage
+- **Monitor and adjust**: Review resource usage monthly and adjust accordingly
+
+### 2. Horizontal vs Vertical Scaling
+
+- **Plan for HPA scaling**: Always calculate quota based on maximum replicas, not minimum
+- **Set realistic HPA ranges**: Consider your typical traffic patterns and growth projections
+- **Account for scaling overhead**: Include buffer for quick scale-up events
+- **Monitor scaling patterns**: Review HPA metrics to optimize min/max replica settings
+
+### 3. Multi-Container Considerations
+
+- **Sum all container resources**: Each pod’s quota usage = sum of all its containers
+- **Don’t forget sidecar containers**: Istio proxies, log shippers, monitoring agents all consume resources
+- **Init containers**: Don’t count toward running quota but need cluster capacity during startup
+- **Consider container startup order**: Resource consumption peaks during rolling deployments
+
+### 3. Environment Parity
+
+- **Maintain ratios across environments**: If PROD uses X, PRE should use ~X, INT can use 0.7X, BLD can use 0.5X
+- **Test with realistic loads**: Ensure INT/PRE environments can handle expected traffic
+
+## Common Mistakes to Avoid
+
+❌ **Using minimum replicas for quota calculation**: Always use maximum HPA replicas for quota requests
+❌ **Forgetting sidecar containers**: Istio proxies, monitoring agents, log shippers all need resources
+❌ **Setting requests too high**: Wastes cluster capacity and prevents efficient scheduling
+❌ **Setting limits too low**: Causes applications to be killed (OOMKilled) under normal load  
+❌ **No limits at all**: Can starve other applications of resources
+❌ **Identical requests and limits**: Reduces scheduling flexibility
+❌ **Not accounting for init containers**: They need temporary cluster capacity during startup
+❌ **Ignoring rolling deployment overhead**: Need extra capacity during deployments (old + new pods)
+❌ **Not considering seasonal traffic**: Plan for peak usage periods and scaling events
+❌ **Missing container resource specs**: Every container (main, sidecar, init) must have resource specs
+
+## Monitoring and Optimization
+
+### Key Metrics to Watch
+
+- **CPU Utilization**: Should be 60-80% of requests under normal load
+- **Memory Utilization**: Should be 70-90% of requests under normal load
+- **Pod Restart Rate**: High restarts may indicate resource constraints
+- **Scheduling Delays**: May indicate insufficient cluster capacity
+
+### Tools for Monitoring
+
+- Kubernetes Dashboard
+- Prometheus + Grafana
+- kubectl top commands
+- Your organization’s monitoring solution
+
+## Request Process
+
+1. **Calculate your requirements** using the worksheet above
+1. **Fill out the resource quota template**
+1. **Submit request** to platform team with:
+- Completed resource quota YAML
+- Business justification
+- Expected traffic patterns
+- Scaling requirements
+1. **Review and approval** by capacity management team
+1. **Implementation** in target clusters
+1. **Validation** that your applications deploy successfully
+
+## Getting Help
+
+- **Platform Team**: For quota approvals and cluster-level issues
+- **DevOps Channel**: For configuration and deployment questions
+- **Documentation**: Internal wiki and runbooks
+- **Office Hours**: Weekly sessions for resource planning help
+
+## Appendix: Resource Estimation Tools
+
+### Comprehensive Calculator Formula
+
+```
+For each service:
+1. List all containers per pod (main + sidecars)
+2. Sum container resources to get per-pod totals
+3. Multiply by MAX replicas (for HPA services) or fixed replicas
+
+Per-Service Calculation:
+Service_CPU_Requests = Σ(container_cpu_requests) × max_replicas
+Service_Memory_Requests = Σ(container_memory_requests) × max_replicas
+
+Namespace Total:
+Total_CPU_Requests = Σ(all_service_cpu_requests)
+Total_Memory_Requests = Σ(all_service_memory_requests)
+
+Final Quota (with buffers):
+Final_CPU_Quota = Total_CPU_Requests × 1.3
+Final_Memory_Quota = Total_Memory_Requests × 1.3
+```
+
+### Multi-Container Pod Calculator
+
+```bash
+# Example calculation script for a pod with multiple containers
+pod_cpu_request=0
+pod_memory_request=0
+
+# Main container
+pod_cpu_request=$((pod_cpu_request + 500))  # 500m
+pod_memory_request=$((pod_memory_request + 1024))  # 1Gi in Mi
+
+# Istio sidecar
+pod_cpu_request=$((pod_cpu_request + 50))   # 50m
+pod_memory_request=$((pod_memory_request + 128))  # 128Mi
+
+# Monitoring sidecar  
+pod_cpu_request=$((pod_cpu_request + 25))   # 25m
+pod_memory_request=$((pod_memory_request + 64))   # 64Mi
+
+# Multiply by max replicas
+max_replicas=10
+service_cpu_request=$((pod_cpu_request * max_replicas))
+service_memory_request=$((pod_memory_request * max_replicas))
+
+echo "Service needs: ${service_cpu_request}m CPU, ${service_memory_request}Mi memory"
+```
+
+### HPA Scaling Considerations
+
+When planning for HPA-enabled services, consider:
+
+1. **Scale-up speed**: How quickly do you need to handle traffic spikes?
+1. **Scale-down delay**: How long to wait before reducing replicas?
+1. **Resource utilization targets**: 70% CPU is common, 80% memory is typical
+1. **Multiple metrics**: Consider scaling on both CPU and memory
+1. **Custom metrics**: Application-specific metrics like queue length
+
+### Load Testing Considerations
+
+- Run load tests in INT environment first
+- Monitor resource usage during peak synthetic load
+- Test HPA scaling behavior under load
+- Measure scale-up and scale-down timing
+- Account for sidecar resource consumption during scaling events
+- Plan for 2-3x growth over next 12 months including HPA max replicas
