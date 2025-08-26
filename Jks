@@ -1,0 +1,213 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jks-init-script
+data:
+  create-jks.sh: |
+    #!/bin/bash
+    set -e
+    
+    echo "Starting JKS creation process..."
+    
+    # Create working directory
+    WORK_DIR="/tmp/certs"
+    mkdir -p $WORK_DIR
+    
+    # Read passwords from secret
+    TRUSTSTORE_PWD=$(cat /secrets/jks-password/truststore_pwd)
+    KEYSTORE_PWD=$(cat /secrets/jks-password/keystore_pwd)
+    
+    echo "Passwords loaded successfully"
+    
+    # Copy certificates to working directory
+    cp /secrets/kafka-cert/ca.crt $WORK_DIR/intermediate-ca.crt
+    cp /secrets/kafka-cert/tls.crt $WORK_DIR/tls.crt
+    cp /secrets/kafka-cert/tls.key $WORK_DIR/tls.key
+    cp /secrets/cyber-root-bundle/ca.crt $WORK_DIR/root-ca.crt
+    
+    echo "Certificates copied to working directory"
+    
+    # Create complete certificate chain
+    cat $WORK_DIR/root-ca.crt $WORK_DIR/intermediate-ca.crt > $WORK_DIR/ca-chain.crt
+    
+    echo "Certificate chain created"
+    
+    # Create truststore with both root and intermediate CA
+    keytool -import -trustcacerts -keystore /output/truststore.jks \
+            -storepass "$TRUSTSTORE_PWD" \
+            -alias root-ca \
+            -file $WORK_DIR/root-ca.crt \
+            -noprompt
+    
+    keytool -import -trustcacerts -keystore /output/truststore.jks \
+            -storepass "$TRUSTSTORE_PWD" \
+            -alias intermediate-ca \
+            -file $WORK_DIR/intermediate-ca.crt \
+            -noprompt
+    
+    echo "Truststore created successfully"
+    
+    # Convert private key and certificate to PKCS12 format first
+    openssl pkcs12 -export -in $WORK_DIR/tls.crt \
+                   -inkey $WORK_DIR/tls.key \
+                   -certfile $WORK_DIR/ca-chain.crt \
+                   -out $WORK_DIR/temp.p12 \
+                   -name kafka-client \
+                   -password pass:"$KEYSTORE_PWD"
+    
+    echo "PKCS12 keystore created"
+    
+    # Import PKCS12 into JKS keystore
+    keytool -importkeystore -srckeystore $WORK_DIR/temp.p12 \
+            -srcstoretype PKCS12 \
+            -srcstorepass "$KEYSTORE_PWD" \
+            -destkeystore /output/keystore.jks \
+            -deststoretype JKS \
+            -deststorepass "$KEYSTORE_PWD" \
+            -srcalias kafka-client \
+            -destalias kafka-client \
+            -noprompt
+    
+    echo "Keystore created successfully"
+    
+    # Set proper permissions
+    chmod 644 /output/truststore.jks
+    chmod 644 /output/keystore.jks
+    
+    # Verify keystores
+    echo "Verifying truststore contents:"
+    keytool -list -keystore /output/truststore.jks -storepass "$TRUSTSTORE_PWD"
+    
+    echo "Verifying keystore contents:"
+    keytool -list -keystore /output/keystore.jks -storepass "$KEYSTORE_PWD"
+    
+    # Clean up temporary files
+    rm -rf $WORK_DIR
+    
+    echo "JKS creation process completed successfully"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-app-example
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka-app
+  template:
+    metadata:
+      labels:
+        app: kafka-app
+    spec:
+      initContainers:
+      - name: create-jks
+        image: openjdk:11-jre-slim
+        command: ["/bin/bash", "/scripts/create-jks.sh"]
+        volumeMounts:
+        - name: jks-init-script
+          mountPath: /scripts
+        - name: kafka-cert
+          mountPath: /secrets/kafka-cert
+          readOnly: true
+        - name: cyber-root-bundle
+          mountPath: /secrets/cyber-root-bundle
+          readOnly: true
+        - name: jks-password
+          mountPath: /secrets/jks-password
+          readOnly: true
+        - name: jks-output
+          mountPath: /output
+        # Install openssl in the container
+        command:
+        - /bin/bash
+        - -c
+        - |
+          apt-get update && apt-get install -y openssl
+          /bin/bash /scripts/create-jks.sh
+      containers:
+      - name: kafka-app
+        image: your-kafka-app:latest
+        volumeMounts:
+        - name: jks-output
+          mountPath: /app/certs
+          readOnly: true
+        - name: jks-password
+          mountPath: /app/secrets/jks-password
+          readOnly: true
+        env:
+        - name: TRUSTSTORE_PATH
+          value: "/app/certs/truststore.jks"
+        - name: KEYSTORE_PATH
+          value: "/app/certs/keystore.jks"
+        # Your application can read passwords from:
+        # /app/secrets/jks-password/truststore_pwd
+        # /app/secrets/jks-password/keystore_pwd
+      volumes:
+      - name: jks-init-script
+        configMap:
+          name: jks-init-script
+          defaultMode: 0755
+      - name: kafka-cert
+        secret:
+          secretName: kafka-cert
+      - name: cyber-root-bundle
+        secret:
+          secretName: cyber-root-bundle
+      - name: jks-password
+        secret:
+          secretName: jks-password
+      - name: jks-output
+        emptyDir: {}
+
+---
+# Alternative: If you prefer a standalone Job to create JKS files
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: create-jks-job
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: create-jks
+        image: openjdk:11-jre-slim
+        command:
+        - /bin/bash
+        - -c
+        - |
+          apt-get update && apt-get install -y openssl
+          /bin/bash /scripts/create-jks.sh
+        volumeMounts:
+        - name: jks-init-script
+          mountPath: /scripts
+        - name: kafka-cert
+          mountPath: /secrets/kafka-cert
+          readOnly: true
+        - name: cyber-root-bundle
+          mountPath: /secrets/cyber-root-bundle
+          readOnly: true
+        - name: jks-password
+          mountPath: /secrets/jks-password
+          readOnly: true
+        - name: jks-output
+          mountPath: /output
+      volumes:
+      - name: jks-init-script
+        configMap:
+          name: jks-init-script
+          defaultMode: 0755
+      - name: kafka-cert
+        secret:
+          secretName: kafka-cert
+      - name: cyber-root-bundle
+        secret:
+          secretName: cyber-root-bundle
+      - name: jks-password
+        secret:
+          secretName: jks-password
+      - name: jks-output
+        persistentVolumeClaim:
+          claimName: jks-storage  # You'll need to create this PVC
