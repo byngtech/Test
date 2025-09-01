@@ -1,0 +1,215 @@
+// pom.xml
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.2.0</version>
+        <relativePath/>
+    </parent>
+    <groupId>com.example</groupId>
+    <artifactId>kafka-producer</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <name>kafka-producer</name>
+    <description>Kafka Producer with Spring Boot</description>
+
+    <properties>
+        <java.version>17</java.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+
+// src/main/java/com/example/kafkaproducer/KafkaProducerApplication.java
+package com.example.kafkaproducer;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class KafkaProducerApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(KafkaProducerApplication.class, args);
+    }
+}
+
+// src/main/java/com/example/kafkaproducer/config/KafkaProducerConfig.java
+package com.example.kafkaproducer.config;
+
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.serialization.StringSerializer;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.core.DefaultKafkaProducerFactory;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.core.ProducerFactory;
+
+import java.util.HashMap;
+import java.util.Map;
+
+@Configuration
+public class KafkaProducerConfig {
+
+    @Value("${app.kafka.bootstrap-servers}")
+    private String bootstrapServers;
+
+    @Value("${app.kafka.producer.key-serializer}")
+    private String keySerializer;
+
+    @Value("${app.kafka.producer.value-serializer}")
+    private String valueSerializer;
+
+    @Value("${app.kafka.producer.acks}")
+    private String acks;
+
+    @Value("${app.kafka.producer.retries}")
+    private int retries;
+
+    @Value("${app.kafka.producer.batch-size}")
+    private int batchSize;
+
+    @Value("${app.kafka.producer.linger-ms}")
+    private int lingerMs;
+
+    @Value("${app.kafka.producer.buffer-memory}")
+    private long bufferMemory;
+
+    @Bean
+    public ProducerFactory<String, String> producerFactory() {
+        Map<String, Object> configProps = new HashMap<>();
+        configProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        configProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, keySerializer);
+        configProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, valueSerializer);
+        configProps.put(ProducerConfig.ACKS_CONFIG, acks);
+        configProps.put(ProducerConfig.RETRIES_CONFIG, retries);
+        configProps.put(ProducerConfig.BATCH_SIZE_CONFIG, batchSize);
+        configProps.put(ProducerConfig.LINGER_MS_CONFIG, lingerMs);
+        configProps.put(ProducerConfig.BUFFER_MEMORY_CONFIG, bufferMemory);
+        
+        return new DefaultKafkaProducerFactory<>(configProps);
+    }
+
+    @Bean
+    public KafkaTemplate<String, String> kafkaTemplate() {
+        return new KafkaTemplate<>(producerFactory());
+    }
+}
+
+// src/main/java/com/example/kafkaproducer/service/MessageProducerService.java
+package com.example.kafkaproducer.service;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.SendResult;
+import org.springframework.stereotype.Service;
+
+import java.util.concurrent.CompletableFuture;
+
+@Service
+public class MessageProducerService {
+
+    @Autowired
+    private KafkaTemplate<String, String> kafkaTemplate;
+
+    @Value("${app.kafka.topic.name}")
+    private String topicName;
+
+    public void sendMessage(String message) {
+        CompletableFuture<SendResult<String, String>> future = kafkaTemplate.send(topicName, message);
+        
+        future.whenComplete((result, ex) -> {
+            if (ex == null) {
+                System.out.println("Sent message=[" + message + "] with offset=[" + 
+                    result.getRecordMetadata().offset() + "]");
+            } else {
+                System.out.println("Unable to send message=[" + message + "] due to : " + ex.getMessage());
+            }
+        });
+    }
+
+    public void sendMessage(String key, String message) {
+        CompletableFuture<SendResult<String, String>> future = kafkaTemplate.send(topicName, key, message);
+        
+        future.whenComplete((result, ex) -> {
+            if (ex == null) {
+                System.out.println("Sent message=[" + message + "] with key=[" + key + 
+                    "] with offset=[" + result.getRecordMetadata().offset() + "]");
+            } else {
+                System.out.println("Unable to send message=[" + message + "] due to : " + ex.getMessage());
+            }
+        });
+    }
+}
+
+// src/main/java/com/example/kafkaproducer/controller/MessageController.java
+package com.example.kafkaproducer.controller;
+
+import com.example.kafkaproducer.service.MessageProducerService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/messages")
+public class MessageController {
+
+    @Autowired
+    private MessageProducerService messageProducerService;
+
+    @PostMapping("/send")
+    public ResponseEntity<String> sendMessage(@RequestBody String message) {
+        messageProducerService.sendMessage(message);
+        return ResponseEntity.ok("Message sent to Kafka topic successfully");
+    }
+
+    @PostMapping("/send/{key}")
+    public ResponseEntity<String> sendMessageWithKey(@PathVariable String key, @RequestBody String message) {
+        messageProducerService.sendMessage(key, message);
+        return ResponseEntity.ok("Message sent to Kafka topic with key successfully");
+    }
+}
+
+// src/main/resources/application.yml
+server:
+  port: 8080
+
+app:
+  kafka:
+    bootstrap-servers: localhost:9092
+    topic:
+      name: test-topic
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      retries: 10
+      batch-size: 16384
+      linger-ms: 1
+      buffer-memory: 33554432
