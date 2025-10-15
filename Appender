@@ -15,7 +15,7 @@ data:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: append-ca-bundle
+  name: add-ca-to-secret
   namespace: istio-system
 spec:
   template:
@@ -28,24 +28,26 @@ spec:
         - /bin/bash
         - -c
         - |
-          # Get the current certificate from the secret
-          CURRENT_CERT=$(kubectl get secret gateway-tls -n istio-system -o jsonpath='{.data.tls\.crt}' | base64 -d)
+          # Get the Venafi CA bundle and encode it
+          CA_BUNDLE=$(cat /venafi-ca/venafi-ca.crt | base64 -w 0)
           
-          # Get the Venafi CA bundle
-          VENAFI_CA=$(cat /venafi-ca/venafi-ca.crt)
+          # Check if ca.crt already exists in the secret
+          if kubectl get secret gateway-tls -n istio-system -o jsonpath='{.data.ca\.crt}' > /dev/null 2>&1; then
+            echo "ca.crt field exists, replacing it..."
+            kubectl patch secret gateway-tls -n istio-system \
+              --type='json' \
+              -p="[{'op': 'replace', 'path': '/data/ca.crt', 'value':'${CA_BUNDLE}'}]"
+          else
+            echo "ca.crt field does not exist, adding it..."
+            kubectl patch secret gateway-tls -n istio-system \
+              --type='json' \
+              -p="[{'op': 'add', 'path': '/data/ca.crt', 'value':'${CA_BUNDLE}'}]"
+          fi
           
-          # Combine them
-          COMBINED_CERT=$(echo -e "${CURRENT_CERT}\n${VENAFI_CA}")
+          echo "Successfully added ca.crt to secret gateway-tls"
           
-          # Update the secret
-          kubectl patch secret gateway-tls -n istio-system \
-            --type='json' \
-            -p="[{'op': 'replace', 'path': '/data/tls.crt', 'value':'$(echo "${COMBINED_CERT}" | base64 -w 0)'}]"
-          
-          # Optionally add as ca.crt field too
-          kubectl patch secret gateway-tls -n istio-system \
-            --type='json' \
-            -p="[{'op': 'add', 'path': '/data/ca.crt', 'value':'$(cat /venafi-ca/venafi-ca.crt | base64 -w 0)'}]"
+          # Verify the update
+          kubectl get secret gateway-tls -n istio-system -o jsonpath='{.data}' | jq 'keys'
         volumeMounts:
         - name: venafi-ca
           mountPath: /venafi-ca
@@ -69,7 +71,7 @@ metadata:
 rules:
 - apiGroups: [""]
   resources: ["secrets"]
-  verbs: ["get", "patch"]
+  verbs: ["get", "patch", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
