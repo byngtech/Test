@@ -1,0 +1,86 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: venafi-ca-bundle
+  namespace: istio-system
+data:
+  venafi-ca.crt: |
+    -----BEGIN CERTIFICATE-----
+    <venafi-intermediate-certificate>
+    -----END CERTIFICATE-----
+    -----BEGIN CERTIFICATE-----
+    <company-root-certificate>
+    -----END CERTIFICATE-----
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: append-ca-bundle
+  namespace: istio-system
+spec:
+  template:
+    spec:
+      serviceAccountName: cert-updater
+      containers:
+      - name: update-secret
+        image: bitnami/kubectl:latest
+        command:
+        - /bin/bash
+        - -c
+        - |
+          # Get the current certificate from the secret
+          CURRENT_CERT=$(kubectl get secret gateway-tls -n istio-system -o jsonpath='{.data.tls\.crt}' | base64 -d)
+          
+          # Get the Venafi CA bundle
+          VENAFI_CA=$(cat /venafi-ca/venafi-ca.crt)
+          
+          # Combine them
+          COMBINED_CERT=$(echo -e "${CURRENT_CERT}\n${VENAFI_CA}")
+          
+          # Update the secret
+          kubectl patch secret gateway-tls -n istio-system \
+            --type='json' \
+            -p="[{'op': 'replace', 'path': '/data/tls.crt', 'value':'$(echo "${COMBINED_CERT}" | base64 -w 0)'}]"
+          
+          # Optionally add as ca.crt field too
+          kubectl patch secret gateway-tls -n istio-system \
+            --type='json' \
+            -p="[{'op': 'add', 'path': '/data/ca.crt', 'value':'$(cat /venafi-ca/venafi-ca.crt | base64 -w 0)'}]"
+        volumeMounts:
+        - name: venafi-ca
+          mountPath: /venafi-ca
+      volumes:
+      - name: venafi-ca
+        configMap:
+          name: venafi-ca-bundle
+      restartPolicy: OnFailure
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cert-updater
+  namespace: istio-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cert-updater
+  namespace: istio-system
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cert-updater
+  namespace: istio-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cert-updater
+subjects:
+- kind: ServiceAccount
+  name: cert-updater
+  namespace: istio-system
