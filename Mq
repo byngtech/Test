@@ -1,0 +1,187 @@
+---
+# ConfigMap with MQ Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mq-config
+data:
+  mq.mqsc: |
+    DEFINE QLOCAL('DEV.QUEUE.1') REPLACE
+    DEFINE QLOCAL('DEV.QUEUE.2') REPLACE
+    DEFINE QLOCAL('DEV.DEAD.LETTER.QUEUE') REPLACE
+    ALTER QMGR DEADQ('DEV.DEAD.LETTER.QUEUE')
+    DEFINE CHANNEL('DEV.APP.SVRCONN') CHLTYPE(SVRCONN) REPLACE
+    DEFINE CHANNEL('DEV.ADMIN.SVRCONN') CHLTYPE(SVRCONN) REPLACE
+    ALTER CHANNEL('DEV.APP.SVRCONN') CHLTYPE(SVRCONN) MCAUSER('app')
+    ALTER CHANNEL('DEV.ADMIN.SVRCONN') CHLTYPE(SVRCONN) MCAUSER('admin')
+    SET CHLAUTH('DEV.APP.SVRCONN') TYPE(BLOCKUSER) USERLIST('nobody') ACTION(ADD)
+    SET CHLAUTH('DEV.ADMIN.SVRCONN') TYPE(BLOCKUSER) USERLIST('nobody') ACTION(ADD)
+    SET AUTHREC PRINCIPAL('app') OBJTYPE(QMGR) AUTHADD(CONNECT,INQ)
+    SET AUTHREC PROFILE('DEV.**') PRINCIPAL('app') OBJTYPE(QUEUE) AUTHADD(BROWSE,GET,INQ,PUT)
+    SET AUTHREC PRINCIPAL('admin') OBJTYPE(QMGR) AUTHADD(ALL)
+    REFRESH SECURITY TYPE(CONNAUTH)
+  mq.ini: |
+    Service:
+      Name=AuthorizationService
+      EntryPoints=14
+    ServiceComponent:
+      Service=AuthorizationService
+      Name=MQSeries.UNIX.auth.service
+      Module=/opt/mqm/lib64/amqzfu
+  qm.ini: |
+    AutoConfig:
+      QueueManager:
+        Name=QM1
+    Log:
+      LogPrimaryFiles=4
+      LogSecondaryFiles=2
+      LogFilePages=4096
+    TCP:
+      KeepAlive=Yes
+      Port=1414
+---
+# Secret for MQ Passwords
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mq-secret
+type: Opaque
+stringData:
+  app-password: "passw0rd"
+  admin-password: "admin"
+---
+# MQ Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ibm-mq
+  labels:
+    app: ibm-mq
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ibm-mq
+  template:
+    metadata:
+      labels:
+        app: ibm-mq
+    spec:
+      containers:
+      - name: ibm-mq
+        image: icr.io/ibm-messaging/mq:latest
+        ports:
+        - containerPort: 1414
+          name: qmgr
+          protocol: TCP
+        - containerPort: 9443
+          name: console
+          protocol: TCP
+        env:
+        - name: LICENSE
+          value: "accept"
+        - name: MQ_QMGR_NAME
+          value: "QM1"
+        - name: MQ_APP_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mq-secret
+              key: app-password
+              optional: true
+        - name: MQ_ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mq-secret
+              key: admin-password
+              optional: true
+        volumeMounts:
+        - name: mq-config
+          mountPath: /etc/mqm
+        - name: mq-data
+          mountPath: /mnt/mqm/data
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          exec:
+            command:
+            - chkmqhealthy
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          exec:
+            command:
+            - chkmqready
+          initialDelaySeconds: 30
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 1
+      volumes:
+      - name: mq-config
+        configMap:
+          name: mq-config
+      - name: mq-data
+        emptyDir: {}
+      securityContext:
+        fsGroup: 0
+---
+# MQ Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: ibm-mq
+  labels:
+    app: ibm-mq
+spec:
+  type: ClusterIP
+  ports:
+  - port: 1414
+    targetPort: 1414
+    protocol: TCP
+    name: qmgr
+  - port: 9443
+    targetPort: 9443
+    protocol: TCP
+    name: console
+  selector:
+    app: ibm-mq
+---
+# Route for MQ Web Console
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: ibm-mq-console
+  labels:
+    app: ibm-mq
+spec:
+  to:
+    kind: Service
+    name: ibm-mq
+  port:
+    targetPort: console
+  tls:
+    termination: passthrough
+    insecureEdgeTerminationPolicy: Redirect
+---
+# Route for MQ Queue Manager
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: ibm-mq-qmgr
+  labels:
+    app: ibm-mq
+spec:
+  to:
+    kind: Service
+    name: ibm-mq
+  port:
+    targetPort: qmgr
+  tls:
+    termination: passthrough
+    insecureEdgeTerminationPolicy: Redirect
