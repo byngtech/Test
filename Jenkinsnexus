@@ -1,0 +1,308 @@
+pipeline {
+    agent any
+    
+    parameters {
+        string(name: 'SOURCE_NEXUS_URL', defaultValue: 'https://source-nexus.example.com', description: 'Source Nexus URL')
+        string(name: 'TARGET_NEXUS_URL', defaultValue: 'https://target-nexus.example.com', description: 'Target Nexus URL')
+        string(name: 'SOURCE_REPO', defaultValue: 'maven-releases', description: 'Source repository name')
+        string(name: 'TARGET_REPO', defaultValue: 'maven-releases', description: 'Target repository name')
+        credentials(name: 'SOURCE_CREDENTIALS', description: 'Source Nexus credentials', credentialType: 'Username with password', required: true)
+        credentials(name: 'TARGET_CREDENTIALS', description: 'Target Nexus credentials', credentialType: 'Username with password', required: true)
+        string(name: 'GROUP_ID_FILTER', defaultValue: '', description: 'Optional: Filter by groupId (e.g., com.example)')
+        booleanParam(name: 'DRY_RUN', defaultValue: true, description: 'Dry run mode - only list artifacts without deploying')
+    }
+    
+    environment {
+        WORK_DIR = "${WORKSPACE}/nexus-migration"
+        MAVEN_OPTS = "-Xmx2g"
+    }
+    
+    tools {
+        maven 'Maven 3.9.0' // Adjust to match your Jenkins Maven installation name
+    }
+    
+    stages {
+        stage('Setup') {
+            steps {
+                script {
+                    echo "Starting Nexus migration using Maven Deploy..."
+                    echo "Source: ${params.SOURCE_NEXUS_URL}/${params.SOURCE_REPO}"
+                    echo "Target: ${params.TARGET_NEXUS_URL}/${params.TARGET_REPO}"
+                    echo "Dry Run: ${params.DRY_RUN}"
+                    
+                    sh """
+                        mkdir -p ${WORK_DIR}
+                        rm -rf ${WORK_DIR}/*
+                        mkdir -p ${WORK_DIR}/artifacts
+                    """
+                    
+                    // Create Maven settings.xml with credentials
+                    withCredentials([
+                        usernamePassword(credentialsId: params.SOURCE_CREDENTIALS, 
+                                       usernameVariable: 'SRC_USER', 
+                                       passwordVariable: 'SRC_PASS'),
+                        usernamePassword(credentialsId: params.TARGET_CREDENTIALS, 
+                                       usernameVariable: 'TGT_USER', 
+                                       passwordVariable: 'TGT_PASS')
+                    ]) {
+                        writeFile file: "${WORK_DIR}/settings.xml", text: """
+<?xml version="1.0" encoding="UTF-8"?>
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0
+                              http://maven.apache.org/xsd/settings-1.0.0.xsd">
+    <servers>
+        <server>
+            <id>source-nexus</id>
+            <username>${SRC_USER}</username>
+            <password>${SRC_PASS}</password>
+        </server>
+        <server>
+            <id>target-nexus</id>
+            <username>${TGT_USER}</username>
+            <password>${TGT_PASS}</password>
+        </server>
+    </servers>
+</settings>
+"""
+                    }
+                }
+            }
+        }
+        
+        stage('Fetch Artifact List') {
+            steps {
+                script {
+                    withCredentials([usernamePassword(credentialsId: params.SOURCE_CREDENTIALS, 
+                                                     usernameVariable: 'SRC_USER', 
+                                                     passwordVariable: 'SRC_PASS')]) {
+                        echo "Fetching artifact list from source Nexus..."
+                        
+                        def continuationToken = null
+                        def allItems = []
+                        def pageCount = 0
+                        
+                        while (true) {
+                            pageCount++
+                            def apiUrl = "${params.SOURCE_NEXUS_URL}/service/rest/v1/components?repository=${params.SOURCE_REPO}"
+                            
+                            if (continuationToken) {
+                                apiUrl += "&continuationToken=${continuationToken}"
+                            }
+                            
+                            echo "Fetching page ${pageCount}..."
+                            
+                            def response = sh(
+                                script: """
+                                    curl -s -u '${SRC_USER}:${SRC_PASS}' '${apiUrl}'
+                                """,
+                                returnStdout: true
+                            ).trim()
+                            
+                            def json = readJSON text: response
+                            
+                            if (json.items) {
+                                allItems.addAll(json.items)
+                                echo "Found ${json.items.size()} items on page ${pageCount} (total: ${allItems.size()})"
+                            }
+                            
+                            continuationToken = json.continuationToken
+                            if (!continuationToken) {
+                                break
+                            }
+                        }
+                        
+                        echo "Total artifacts found: ${allItems.size()}"
+                        
+                        // Filter by groupId if specified
+                        if (params.GROUP_ID_FILTER) {
+                            allItems = allItems.findAll { it.group?.startsWith(params.GROUP_ID_FILTER) }
+                            echo "After filtering by groupId '${params.GROUP_ID_FILTER}': ${allItems.size()} artifacts"
+                        }
+                        
+                        writeJSON file: "${WORK_DIR}/artifacts.json", json: allItems
+                        env.ARTIFACT_COUNT = allItems.size().toString()
+                    }
+                }
+            }
+        }
+        
+        stage('Download and Deploy Artifacts') {
+            steps {
+                script {
+                    def artifacts = readJSON file: "${WORK_DIR}/artifacts.json"
+                    
+                    withCredentials([
+                        usernamePassword(credentialsId: params.SOURCE_CREDENTIALS, 
+                                       usernameVariable: 'SRC_USER', 
+                                       passwordVariable: 'SRC_PASS')
+                    ]) {
+                        def successCount = 0
+                        def failureCount = 0
+                        def skippedCount = 0
+                        
+                        artifacts.eachWithIndex { component, idx ->
+                            try {
+                                echo "\n[${idx + 1}/${artifacts.size()}] Processing: ${component.group}:${component.name}:${component.version}"
+                                
+                                if (params.DRY_RUN) {
+                                    echo "  DRY RUN - Would deploy ${component.assets?.size() ?: 0} assets"
+                                    component.assets?.each { asset ->
+                                        echo "    - ${asset.path} (${asset.maven2?.extension ?: 'unknown'})"
+                                    }
+                                    skippedCount++
+                                } else {
+                                    def groupId = component.group
+                                    def artifactId = component.name
+                                    def version = component.version
+                                    
+                                    // Download all assets for this component
+                                    def jarFile = null
+                                    def pomFile = null
+                                    def sourcesFile = null
+                                    def javadocFile = null
+                                    def otherFiles = []
+                                    
+                                    component.assets?.each { asset ->
+                                        def fileName = asset.path.split('/').last()
+                                        def localPath = "${WORK_DIR}/artifacts/${fileName}"
+                                        def extension = asset.maven2?.extension ?: ''
+                                        def classifier = asset.maven2?.classifier ?: ''
+                                        
+                                        echo "  Downloading: ${fileName}"
+                                        sh """
+                                            curl -s -u '${SRC_USER}:${SRC_PASS}' \
+                                                -o '${localPath}' \
+                                                '${asset.downloadUrl}'
+                                        """
+                                        
+                                        // Categorize files
+                                        if (extension == 'pom') {
+                                            pomFile = localPath
+                                        } else if (extension == 'jar' && !classifier) {
+                                            jarFile = localPath
+                                        } else if (classifier == 'sources') {
+                                            sourcesFile = localPath
+                                        } else if (classifier == 'javadoc') {
+                                            javadocFile = localPath
+                                        } else if (extension) {
+                                            otherFiles << [file: localPath, extension: extension, classifier: classifier]
+                                        }
+                                    }
+                                    
+                                    // Deploy using mvn deploy:deploy-file
+                                    if (jarFile && pomFile) {
+                                        def mvnCmd = """
+                                            mvn deploy:deploy-file \
+                                                -s ${WORK_DIR}/settings.xml \
+                                                -DgroupId=${groupId} \
+                                                -DartifactId=${artifactId} \
+                                                -Dversion=${version} \
+                                                -Dpackaging=jar \
+                                                -Dfile=${jarFile} \
+                                                -DpomFile=${pomFile} \
+                                                -DrepositoryId=target-nexus \
+                                                -Durl=${params.TARGET_NEXUS_URL}/repository/${params.TARGET_REPO}
+                                        """
+                                        
+                                        // Add sources if available
+                                        if (sourcesFile) {
+                                            mvnCmd += " -Dsources=${sourcesFile}"
+                                        }
+                                        
+                                        // Add javadoc if available
+                                        if (javadocFile) {
+                                            mvnCmd += " -Djavadoc=${javadocFile}"
+                                        }
+                                        
+                                        echo "  Deploying with Maven..."
+                                        sh mvnCmd
+                                        
+                                        // Deploy other classified artifacts separately
+                                        otherFiles.each { otherFile ->
+                                            def classifierOpt = otherFile.classifier ? "-Dclassifier=${otherFile.classifier}" : ""
+                                            sh """
+                                                mvn deploy:deploy-file \
+                                                    -s ${WORK_DIR}/settings.xml \
+                                                    -DgroupId=${groupId} \
+                                                    -DartifactId=${artifactId} \
+                                                    -Dversion=${version} \
+                                                    -Dpackaging=${otherFile.extension} \
+                                                    ${classifierOpt} \
+                                                    -Dfile=${otherFile.file} \
+                                                    -DrepositoryId=target-nexus \
+                                                    -Durl=${params.TARGET_NEXUS_URL}/repository/${params.TARGET_REPO} \
+                                                    -DgeneratePom=false
+                                            """
+                                        }
+                                        
+                                    } else if (pomFile && !jarFile) {
+                                        // POM-only artifact
+                                        echo "  Deploying POM-only artifact..."
+                                        sh """
+                                            mvn deploy:deploy-file \
+                                                -s ${WORK_DIR}/settings.xml \
+                                                -DgroupId=${groupId} \
+                                                -DartifactId=${artifactId} \
+                                                -Dversion=${version} \
+                                                -Dpackaging=pom \
+                                                -Dfile=${pomFile} \
+                                                -DrepositoryId=target-nexus \
+                                                -Durl=${params.TARGET_NEXUS_URL}/repository/${params.TARGET_REPO}
+                                        """
+                                    } else {
+                                        echo "  WARNING: No POM file found, skipping..."
+                                        skippedCount++
+                                        return
+                                    }
+                                    
+                                    echo "  ✓ Deployed successfully"
+                                    successCount++
+                                    
+                                    // Clean up downloaded files
+                                    sh "rm -rf ${WORK_DIR}/artifacts/*"
+                                }
+                            } catch (Exception e) {
+                                echo "  ✗ ERROR: ${e.message}"
+                                failureCount++
+                                // Clean up on failure too
+                                sh "rm -rf ${WORK_DIR}/artifacts/*"
+                            }
+                        }
+                        
+                        echo "\n" + "=".multiply(60)
+                        echo "Migration Summary:"
+                        echo "  Total artifacts: ${artifacts.size()}"
+                        if (params.DRY_RUN) {
+                            echo "  Skipped (dry run): ${skippedCount}"
+                        } else {
+                            echo "  Successful: ${successCount}"
+                            echo "  Failed: ${failureCount}"
+                            echo "  Skipped: ${skippedCount}"
+                        }
+                        echo "=".multiply(60)
+                        
+                        if (failureCount > 0 && !params.DRY_RUN) {
+                            error("Migration completed with ${failureCount} failures")
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                echo "Cleaning up workspace..."
+                sh "rm -rf ${WORK_DIR}"
+            }
+        }
+        success {
+            echo "Migration completed successfully!"
+        }
+        failure {
+            echo "Migration failed. Please check the logs."
+        }
+    }
+}
