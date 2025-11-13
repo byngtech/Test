@@ -1,0 +1,585 @@
+---
+# File: helm-chart/schema-upload-files/Chart.yaml
+apiVersion: v2
+name: schema-upload-files
+description: Kubernetes Job to upload schema files to GCS with directory structure preservation
+type: application
+version: 1.0.0
+appVersion: "1.0"
+keywords:
+  - gcs
+  - schema
+  - upload
+maintainers:
+  - name: Platform Team
+
+---
+# File: helm-chart/schema-upload-files/values.yaml
+# Default values for schema-upload-files
+# This can be overridden by environment-specific configs
+
+job:
+  # Name prefix for the job (timestamp will be appended)
+  namePrefix: schema-copy-to-gcs
+  
+  # TTL for job cleanup after completion (in seconds)
+  ttlSecondsAfterFinished: 3600
+  
+  # Number of retries on failure
+  backoffLimit: 3
+  
+  # Resource limits
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "250m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+
+git:
+  # Git repository URL (required)
+  repoUrl: ""
+  
+  # Git branch to clone
+  branch: "main"
+  
+  # Path to bucket-contents folder in the repository
+  bucketContentsPath: "bucket-contents"
+  
+  # Git clone depth (use 1 for shallow clone)
+  depth: 1
+
+gcs:
+  # GCS bucket name (required)
+  bucketName: ""
+  
+  # Base folder in GCS bucket where directory structure will be maintained
+  # If set to "schemas", and bucket-contents has version1_0/file.json,
+  # the file will be uploaded to gs://bucket/schemas/version1_0/file.json
+  baseFolder: ""
+  
+  # GCP Project ID
+  projectId: ""
+
+serviceAccount:
+  # Kubernetes service account name (with Workload Identity binding)
+  name: "gcs-schema-copy-sa"
+  
+  # Annotations for Workload Identity
+  annotations:
+    iam.gke.io/gcp-service-account: ""
+
+# Namespace where the job will be deployed
+namespace: "default"
+
+# Labels to apply to all resources
+labels:
+  app: schema-upload
+  managed-by: harness
+
+# Additional annotations for the job
+annotations: {}
+
+---
+# File: helm-chart/schema-upload-files/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.serviceAccount.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- range $key, $value := .Values.labels }}
+    {{ $key }}: {{ $value }}
+    {{- end }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+
+---
+# File: helm-chart/schema-upload-files/templates/job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Values.job.namePrefix }}-{{ now | date "20060102-150405" }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- range $key, $value := .Values.labels }}
+    {{ $key }}: {{ $value }}
+    {{- end }}
+    job-type: schema-upload
+  {{- with .Values.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ttlSecondsAfterFinished: {{ .Values.job.ttlSecondsAfterFinished }}
+  backoffLimit: {{ .Values.job.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        {{- range $key, $value := .Values.labels }}
+        {{ $key }}: {{ $value }}
+        {{- end }}
+        job-type: schema-upload
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      restartPolicy: Never
+      initContainers:
+        - name: git-clone
+          image: alpine/git:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "=========================================="
+              echo "Git Clone Started"
+              echo "=========================================="
+              echo "Repository: {{ .Values.git.repoUrl }}"
+              echo "Branch: {{ .Values.git.branch }}"
+              echo "Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+              echo "=========================================="
+              
+              # Clone the repository
+              git clone --depth {{ .Values.git.depth }} --branch {{ .Values.git.branch }} {{ .Values.git.repoUrl }} /workspace/repo
+              
+              echo "Repository cloned successfully"
+              
+              # Verify bucket-contents folder exists
+              if [ ! -d "/workspace/repo/{{ .Values.git.bucketContentsPath }}" ]; then
+                echo "ERROR: bucket-contents folder not found at path: {{ .Values.git.bucketContentsPath }}"
+                exit 1
+              fi
+              
+              # Display directory structure
+              echo ""
+              echo "Directory structure in bucket-contents:"
+              cd /workspace/repo/{{ .Values.git.bucketContentsPath }}
+              find . -type f | sort
+              
+              echo ""
+              echo "Git clone completed successfully"
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+      
+      containers:
+        - name: upload-to-gcs
+          image: google/cloud-sdk:alpine
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              
+              echo "=========================================="
+              echo "Schema Upload to GCS Started"
+              echo "=========================================="
+              echo "Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+              echo "GCS Bucket: {{ .Values.gcs.bucketName }}"
+              echo "Base Folder: {{ .Values.gcs.baseFolder }}"
+              echo "Source Path: {{ .Values.git.bucketContentsPath }}"
+              echo "GCP Project: {{ .Values.gcs.projectId }}"
+              echo "=========================================="
+              
+              # Navigate to bucket-contents directory
+              cd /workspace/repo/{{ .Values.git.bucketContentsPath }}
+              
+              # Count total files
+              TOTAL_FILES=$(find . -type f | wc -l)
+              echo "Total files to upload: $TOTAL_FILES"
+              
+              if [ "$TOTAL_FILES" -eq 0 ]; then
+                echo "ERROR: No files found in {{ .Values.git.bucketContentsPath }}"
+                exit 1
+              fi
+              
+              # Display file structure
+              echo ""
+              echo "Files to be uploaded:"
+              find . -type f | sort
+              echo ""
+              
+              # Set GCS destination path
+              {{- if .Values.gcs.baseFolder }}
+              GCS_DESTINATION="gs://{{ .Values.gcs.bucketName }}/{{ .Values.gcs.baseFolder }}/"
+              {{- else }}
+              GCS_DESTINATION="gs://{{ .Values.gcs.bucketName }}/"
+              {{- end }}
+              
+              echo "Destination: $GCS_DESTINATION"
+              echo ""
+              echo "Starting upload with directory structure preservation..."
+              
+              # Upload files maintaining directory structure
+              # The -r flag with trailing /. ensures directory structure is maintained
+              gsutil -m rsync -r -d . "$GCS_DESTINATION"
+              
+              echo ""
+              echo "Upload completed. Verifying files in GCS..."
+              
+              # List uploaded files
+              echo ""
+              echo "Files in GCS bucket:"
+              gsutil ls -r "$GCS_DESTINATION"
+              
+              # Verify file count in GCS
+              GCS_FILE_COUNT=$(gsutil ls -r "$GCS_DESTINATION**" | grep -v "/$" | wc -l)
+              
+              echo ""
+              echo "=========================================="
+              echo "Upload Summary"
+              echo "=========================================="
+              echo "Local files processed: $TOTAL_FILES"
+              echo "Files in GCS: $GCS_FILE_COUNT"
+              echo "Destination: $GCS_DESTINATION"
+              echo "=========================================="
+              
+              if [ "$GCS_FILE_COUNT" -eq 0 ]; then
+                echo "ERROR: Upload verification failed - no files found in destination"
+                exit 1
+              fi
+              
+              echo ""
+              echo "Schema upload completed successfully!"
+              echo "Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+          env:
+            - name: CLOUDSDK_CORE_PROJECT
+              value: "{{ .Values.gcs.projectId }}"
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+          resources:
+            {{- toYaml .Values.job.resources | nindent 12 }}
+      
+      volumes:
+        - name: workspace
+          emptyDir: {}
+
+---
+# File: helm-overrides/bld01-config.yaml
+# Build/Development Environment Configuration
+
+git:
+  repoUrl: "https://github.com/your-org/your-schema-repo.git"
+  branch: "develop"
+  bucketContentsPath: "bucket-contents"
+  depth: 1
+
+gcs:
+  bucketName: "your-project-schemas-bld01"
+  baseFolder: "schemas"
+  projectId: "your-gcp-project-bld01"
+
+serviceAccount:
+  name: "gcs-schema-copy-sa"
+  annotations:
+    iam.gke.io/gcp-service-account: "gcs-schema-copy-sa@your-gcp-project-bld01.iam.gserviceaccount.com"
+
+namespace: "schema-upload"
+
+labels:
+  app: schema-upload
+  environment: bld01
+  managed-by: harness
+
+job:
+  namePrefix: schema-copy-to-gcs
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 3
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "250m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+
+---
+# File: helm-overrides/pre01-config.yaml
+# Pre-Production Environment Configuration
+
+git:
+  repoUrl: "https://github.com/your-org/your-schema-repo.git"
+  branch: "release"
+  bucketContentsPath: "bucket-contents"
+  depth: 1
+
+gcs:
+  bucketName: "your-project-schemas-pre01"
+  baseFolder: "schemas"
+  projectId: "your-gcp-project-pre01"
+
+serviceAccount:
+  name: "gcs-schema-copy-sa"
+  annotations:
+    iam.gke.io/gcp-service-account: "gcs-schema-copy-sa@your-gcp-project-pre01.iam.gserviceaccount.com"
+
+namespace: "schema-upload"
+
+labels:
+  app: schema-upload
+  environment: pre01
+  managed-by: harness
+
+job:
+  namePrefix: schema-copy-to-gcs
+  ttlSecondsAfterFinished: 7200  # 2 hours retention for pre-prod
+  backoffLimit: 2
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "250m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+
+---
+# File: helm-overrides/prd01-config.yaml
+# Production Environment Configuration
+
+git:
+  repoUrl: "https://github.com/your-org/your-schema-repo.git"
+  branch: "main"
+  bucketContentsPath: "bucket-contents"
+  depth: 1
+
+gcs:
+  bucketName: "your-project-schemas-prd01"
+  baseFolder: "schemas"
+  projectId: "your-gcp-project-prd01"
+
+serviceAccount:
+  name: "gcs-schema-copy-sa"
+  annotations:
+    iam.gke.io/gcp-service-account: "gcs-schema-copy-sa@your-gcp-project-prd01.iam.gserviceaccount.com"
+
+namespace: "schema-upload"
+
+labels:
+  app: schema-upload
+  environment: prd01
+  managed-by: harness
+
+job:
+  namePrefix: schema-copy-to-gcs
+  ttlSecondsAfterFinished: 86400  # 24 hours retention for production
+  backoffLimit: 1  # Fail fast in production
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "500m"
+    limits:
+      memory: "1Gi"
+      cpu: "1000m"
+
+---
+# File: SETUP-GUIDE.md
+# Schema Upload to GCS - Setup Guide
+
+## Repository Structure
+
+```
+your-repo/
+├── bucket-contents/           # Source files to upload
+│   ├── version1_0/
+│   │   └── uapi_schema.json
+│   └── version2_0/
+│       └── uapi_schema.json
+├── helm-chart/
+│   └── schema-upload-files/
+│       ├── Chart.yaml
+│       ├── values.yaml
+│       └── templates/
+│           ├── job.yaml
+│           └── serviceaccount.yaml
+└── helm-overrides/
+    ├── bld01-config.yaml
+    ├── pre01-config.yaml
+    └── prd01-config.yaml
+```
+
+## Workload Identity Setup (Per Environment)
+
+### 1. Create GCP Service Account
+```bash
+export ENV="bld01"  # or pre01, prd01
+export GCP_PROJECT="your-gcp-project-${ENV}"
+export K8S_NAMESPACE="schema-upload"
+
+gcloud iam service-accounts create gcs-schema-copy-sa \
+    --display-name="Schema Copy to GCS Service Account - ${ENV}" \
+    --project=${GCP_PROJECT}
+```
+
+### 2. Grant GCS Permissions
+```bash
+# For specific bucket
+gcloud storage buckets add-iam-policy-binding gs://your-bucket-name-${ENV} \
+    --member="serviceAccount:gcs-schema-copy-sa@${GCP_PROJECT}.iam.gserviceaccount.com" \
+    --role="roles/storage.objectAdmin"
+
+# OR for project-wide access
+gcloud projects add-iam-policy-binding ${GCP_PROJECT} \
+    --member="serviceAccount:gcs-schema-copy-sa@${GCP_PROJECT}.iam.gserviceaccount.com" \
+    --role="roles/storage.objectAdmin"
+```
+
+### 3. Setup Workload Identity Binding
+```bash
+gcloud iam service-accounts add-iam-policy-binding \
+    gcs-schema-copy-sa@${GCP_PROJECT}.iam.gserviceaccount.com \
+    --role roles/iam.workloadIdentityUser \
+    --member "serviceAccount:${GCP_PROJECT}.svc.id.goog[${K8S_NAMESPACE}/gcs-schema-copy-sa]"
+```
+
+### 4. Create Kubernetes Service Account (via Helm or manually)
+```bash
+# This is handled by Helm chart, but you can verify:
+kubectl get serviceaccount gcs-schema-copy-sa -n ${K8S_NAMESPACE}
+```
+
+## Deployment with Existing Harness Template
+
+### Using Harness Helm Deployment Template
+
+1. **Create Service in Harness:**
+   - Service Name: `schema-upload-files`
+   - Deployment Type: `Kubernetes`
+   - Add Helm chart from your Git repository
+
+2. **Configure Manifest:**
+   - Chart Path: `helm-chart/schema-upload-files`
+   - Values YAML Path: `helm-chart/schema-upload-files/values.yaml`
+
+3. **Add Environment-Specific Overrides:**
+   - For BLD01: `helm-overrides/bld01-config.yaml`
+   - For PRE01: `helm-overrides/pre01-config.yaml`
+   - For PRD01: `helm-overrides/prd01-config.yaml`
+
+4. **Pipeline Execution:**
+   - Your existing Helm deployment template will:
+     - Pull the Helm chart
+     - Apply environment-specific overrides
+     - Deploy the job to the target cluster
+     - Wait for job completion (if configured)
+
+## Testing the Setup
+
+### Manual Helm Deployment Test
+```bash
+# Deploy to BLD01
+helm upgrade --install schema-upload \
+    ./helm-chart/schema-upload-files \
+    -f helm-overrides/bld01-config.yaml \
+    -n schema-upload
+
+# Check job status
+kubectl get jobs -n schema-upload
+
+# View logs
+kubectl logs -n schema-upload -l job-type=schema-upload --tail=100 -f
+```
+
+### Verify in GCS
+```bash
+# List files in bucket
+gsutil ls -r gs://your-bucket-name-bld01/schemas/
+
+# Should show structure like:
+# gs://your-bucket-name-bld01/schemas/version1_0/uapi_schema.json
+# gs://your-bucket-name-bld01/schemas/version2_0/uapi_schema.json
+```
+
+## Directory Structure Preservation
+
+The job uses `gsutil rsync` which maintains the exact directory structure from `bucket-contents/`:
+
+**Source (Git repo):**
+```
+bucket-contents/
+├── version1_0/
+│   └── uapi_schema.json
+└── version2_0/
+    └── uapi_schema.json
+```
+
+**Destination (GCS):**
+```
+gs://bucket/schemas/
+├── version1_0/
+│   └── uapi_schema.json
+└── version2_0/
+    └── uapi_schema.json
+```
+
+## Configuration Options
+
+### Repository-Specific Configuration
+Each repository can have different structure in `bucket-contents/`. The job will preserve whatever structure exists:
+
+```yaml
+# Repo A: Simple structure
+bucket-contents/
+└── schemas/
+    └── main.json
+
+# Repo B: Versioned structure  
+bucket-contents/
+├── v1/
+│   └── schema.json
+└── v2/
+    └── schema.json
+
+# Repo C: Complex nested structure
+bucket-contents/
+├── service-a/
+│   ├── dev/
+│   └── prod/
+└── service-b/
+    └── schemas/
+```
+
+All structures will be preserved as-is when uploaded to GCS.
+
+## Troubleshooting
+
+### View Job Logs
+```bash
+kubectl logs -n schema-upload -l job-type=schema-upload
+```
+
+### Check Service Account Permissions
+```bash
+# Test from within cluster
+kubectl run -it --rm test-wi \
+    --image=google/cloud-sdk:alpine \
+    --serviceaccount=gcs-schema-copy-sa \
+    -n schema-upload \
+    -- gsutil ls gs://your-bucket-name/
+```
+
+### Common Issues
+
+1. **"Permission denied" errors:**
+   - Verify Workload Identity binding
+   - Check GCS bucket permissions
+   - Ensure service account annotation is correct
+
+2. **"bucket-contents folder not found":**
+   - Verify path in values.yaml matches your repo structure
+   - Check git branch configuration
+
+3. **Job keeps restarting:**
+   - Check resource limits
+   - Review logs for errors
+   - Verify bucket name and project ID
