@@ -1,8 +1,304 @@
----
+#!/usr/bin/env python3
+"""
+File: copy_schemas_to_gcs.py
+Description: Upload schema files to GCS bucket maintaining directory structure
+"""
+
+import os
+import sys
+import logging
+from pathlib import Path
+from datetime import datetime
+from google.cloud import storage
+from typing import List, Tuple
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+
+class SchemaUploader:
+    """Handle uploading schema files to GCS with directory structure preservation"""
+    
+    def __init__(self, bucket_name: str, gcp_project: str, base_folder: str = ""):
+        """
+        Initialize the uploader
+        
+        Args:
+            bucket_name: GCS bucket name
+            gcp_project: GCP project ID
+            base_folder: Base folder path in GCS bucket (optional)
+        """
+        self.bucket_name = bucket_name
+        self.gcp_project = gcp_project
+        self.base_folder = base_folder.strip('/') if base_folder else ""
+        
+        # Initialize GCS client (uses Workload Identity automatically)
+        self.storage_client = storage.Client(project=gcp_project)
+        self.bucket = self.storage_client.bucket(bucket_name)
+        
+        logger.info(f"Initialized uploader for bucket: {bucket_name}")
+        logger.info(f"GCP Project: {gcp_project}")
+        logger.info(f"Base folder: {self.base_folder or '(root)'}")
+    
+    def find_schema_files(self, source_dir: str) -> List[Tuple[Path, str]]:
+        """
+        Find all files in source directory and compute their relative paths
+        
+        Args:
+            source_dir: Source directory containing schema files
+            
+        Returns:
+            List of tuples (file_path, relative_path)
+        """
+        source_path = Path(source_dir)
+        
+        if not source_path.exists():
+            raise FileNotFoundError(f"Source directory not found: {source_dir}")
+        
+        files = []
+        for file_path in source_path.rglob('*'):
+            if file_path.is_file():
+                # Compute relative path from source directory
+                relative_path = file_path.relative_to(source_path)
+                files.append((file_path, str(relative_path)))
+        
+        return files
+    
+    def upload_file(self, local_path: Path, gcs_path: str) -> bool:
+        """
+        Upload a single file to GCS
+        
+        Args:
+            local_path: Local file path
+            gcs_path: Destination path in GCS
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            blob = self.bucket.blob(gcs_path)
+            blob.upload_from_filename(str(local_path))
+            logger.info(f"✓ Uploaded: {local_path.name} -> gs://{self.bucket_name}/{gcs_path}")
+            return True
+        except Exception as e:
+            logger.error(f"✗ Failed to upload {local_path}: {str(e)}")
+            return False
+    
+    def upload_schemas(self, source_dir: str) -> Tuple[int, int]:
+        """
+        Upload all schema files maintaining directory structure
+        
+        Args:
+            source_dir: Source directory containing schema files
+            
+        Returns:
+            Tuple of (successful_uploads, failed_uploads)
+        """
+        logger.info("=" * 60)
+        logger.info("Starting Schema Upload Process")
+        logger.info("=" * 60)
+        
+        # Find all files
+        files = self.find_schema_files(source_dir)
+        total_files = len(files)
+        
+        if total_files == 0:
+            logger.warning(f"No files found in {source_dir}")
+            return 0, 0
+        
+        logger.info(f"Found {total_files} files to upload")
+        logger.info("")
+        
+        # Display directory structure
+        logger.info("Directory structure:")
+        for _, relative_path in sorted(files):
+            logger.info(f"  {relative_path}")
+        logger.info("")
+        
+        # Upload files
+        successful = 0
+        failed = 0
+        
+        for local_path, relative_path in files:
+            # Construct GCS path maintaining directory structure
+            if self.base_folder:
+                gcs_path = f"{self.base_folder}/{relative_path}"
+            else:
+                gcs_path = relative_path
+            
+            if self.upload_file(local_path, gcs_path):
+                successful += 1
+            else:
+                failed += 1
+        
+        return successful, failed
+    
+    def verify_upload(self, source_dir: str) -> bool:
+        """
+        Verify uploaded files in GCS
+        
+        Args:
+            source_dir: Source directory to compare against
+            
+        Returns:
+            True if verification successful
+        """
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("Verifying Upload")
+        logger.info("=" * 60)
+        
+        # Get local files
+        local_files = {rel_path for _, rel_path in self.find_schema_files(source_dir)}
+        
+        # List GCS files
+        prefix = f"{self.base_folder}/" if self.base_folder else ""
+        blobs = list(self.bucket.list_blobs(prefix=prefix))
+        
+        gcs_files = set()
+        logger.info(f"Files in GCS (gs://{self.bucket_name}/{prefix}):")
+        for blob in blobs:
+            # Remove base folder prefix to get relative path
+            if self.base_folder:
+                relative_path = blob.name.replace(f"{self.base_folder}/", "", 1)
+            else:
+                relative_path = blob.name
+            gcs_files.add(relative_path)
+            logger.info(f"  {relative_path}")
+        
+        # Compare
+        missing_in_gcs = local_files - gcs_files
+        extra_in_gcs = gcs_files - local_files
+        
+        if missing_in_gcs:
+            logger.error(f"Missing {len(missing_in_gcs)} files in GCS:")
+            for file in missing_in_gcs:
+                logger.error(f"  - {file}")
+            return False
+        
+        if extra_in_gcs:
+            logger.warning(f"Found {len(extra_in_gcs)} extra files in GCS (will remain):")
+            for file in extra_in_gcs:
+                logger.warning(f"  + {file}")
+        
+        logger.info("")
+        logger.info("✓ Verification successful!")
+        return True
+    
+    def print_summary(self, successful: int, failed: int, start_time: datetime):
+        """Print upload summary"""
+        duration = (datetime.now() - start_time).total_seconds()
+        
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("Upload Summary")
+        logger.info("=" * 60)
+        logger.info(f"Total files processed: {successful + failed}")
+        logger.info(f"Successful uploads: {successful}")
+        logger.info(f"Failed uploads: {failed}")
+        logger.info(f"Duration: {duration:.2f} seconds")
+        logger.info(f"Destination: gs://{self.bucket_name}/{self.base_folder or '(root)'}")
+        logger.info("=" * 60)
+
+
+def main():
+    """Main execution function"""
+    start_time = datetime.now()
+    
+    # Get configuration from environment variables
+    bucket_name = os.getenv('GCS_BUCKET_NAME')
+    gcp_project = os.getenv('GCP_PROJECT_ID')
+    base_folder = os.getenv('GCS_BASE_FOLDER', '')
+    source_dir = os.getenv('SOURCE_DIR', '/schemas')
+    
+    # Validate required parameters
+    if not bucket_name:
+        logger.error("ERROR: GCS_BUCKET_NAME environment variable is required")
+        sys.exit(1)
+    
+    if not gcp_project:
+        logger.error("ERROR: GCP_PROJECT_ID environment variable is required")
+        sys.exit(1)
+    
+    try:
+        # Initialize uploader
+        uploader = SchemaUploader(bucket_name, gcp_project, base_folder)
+        
+        # Upload files
+        successful, failed = uploader.upload_schemas(source_dir)
+        
+        if failed > 0:
+            logger.error(f"Upload completed with {failed} failures")
+            sys.exit(1)
+        
+        # Verify upload
+        if not uploader.verify_upload(source_dir):
+            logger.error("Verification failed")
+            sys.exit(1)
+        
+        # Print summary
+        uploader.print_summary(successful, failed, start_time)
+        
+        logger.info("")
+        logger.info("✓ Schema upload completed successfully!")
+        sys.exit(0)
+        
+    except Exception as e:
+        logger.error(f"Fatal error: {str(e)}", exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+
+
+# =============================================================================
+# DOCKERFILE
+# File: Dockerfile
+# =============================================================================
+"""
+FROM python:3.11-slim
+
+# Install required packages
+RUN pip install --no-cache-dir google-cloud-storage==2.10.0
+
+# Copy schema files
+COPY bucket-contents/ /schemas/
+
+# Copy Python script
+COPY copy_schemas_to_gcs.py /app/copy_schemas_to_gcs.py
+
+# Set working directory
+WORKDIR /app
+
+# Make script executable
+RUN chmod +x copy_schemas_to_gcs.py
+
+# Run the upload script
+ENTRYPOINT ["python3", "/app/copy_schemas_to_gcs.py"]
+"""
+
+# =============================================================================
+# REQUIREMENTS.TXT
+# File: requirements.txt
+# =============================================================================
+"""
+google-cloud-storage==2.10.0
+"""
+
+# =============================================================================
+# HELM CHART - Chart.yaml
 # File: helm-chart/schema-upload-files/Chart.yaml
+# =============================================================================
+"""
 apiVersion: v2
 name: schema-upload-files
-description: Kubernetes Job to upload schema files to GCS with directory structure preservation
+description: Kubernetes Job to upload schema files to GCS using Python
 type: application
 version: 1.0.0
 appVersion: "1.0"
@@ -10,25 +306,20 @@ keywords:
   - gcs
   - schema
   - upload
+  - python
 maintainers:
   - name: Platform Team
+"""
 
----
+# =============================================================================
+# HELM CHART - values.yaml
 # File: helm-chart/schema-upload-files/values.yaml
-# Default values for schema-upload-files
-# This can be overridden by environment-specific configs
-
+# =============================================================================
+"""
 job:
-  # Name prefix for the job (timestamp will be appended)
   namePrefix: schema-copy-to-gcs
-  
-  # TTL for job cleanup after completion (in seconds)
   ttlSecondsAfterFinished: 3600
-  
-  # Number of retries on failure
   backoffLimit: 3
-  
-  # Resource limits
   resources:
     requests:
       memory: "256Mi"
@@ -37,52 +328,35 @@ job:
       memory: "512Mi"
       cpu: "500m"
 
-git:
-  # Git repository URL (required)
-  repoUrl: ""
-  
-  # Git branch to clone
-  branch: "main"
-  
-  # Path to bucket-contents folder in the repository
-  bucketContentsPath: "bucket-contents"
-  
-  # Git clone depth (use 1 for shallow clone)
-  depth: 1
+image:
+  repository: ""  # e.g., gcr.io/project/schema-uploader
+  tag: ""  # e.g., v1.0.0
+  pullPolicy: IfNotPresent
 
 gcs:
-  # GCS bucket name (required)
   bucketName: ""
-  
-  # Base folder in GCS bucket where directory structure will be maintained
-  # If set to "schemas", and bucket-contents has version1_0/file.json,
-  # the file will be uploaded to gs://bucket/schemas/version1_0/file.json
   baseFolder: ""
-  
-  # GCP Project ID
   projectId: ""
 
 serviceAccount:
-  # Kubernetes service account name (with Workload Identity binding)
   name: "gcs-schema-copy-sa"
-  
-  # Annotations for Workload Identity
   annotations:
     iam.gke.io/gcp-service-account: ""
 
-# Namespace where the job will be deployed
 namespace: "default"
 
-# Labels to apply to all resources
 labels:
   app: schema-upload
   managed-by: harness
 
-# Additional annotations for the job
 annotations: {}
+"""
 
----
+# =============================================================================
+# HELM CHART - serviceaccount.yaml
 # File: helm-chart/schema-upload-files/templates/serviceaccount.yaml
+# =============================================================================
+"""
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -96,9 +370,13 @@ metadata:
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
+"""
 
----
+# =============================================================================
+# HELM CHART - job.yaml
 # File: helm-chart/schema-upload-files/templates/job.yaml
+# =============================================================================
+"""
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -126,154 +404,32 @@ spec:
     spec:
       serviceAccountName: {{ .Values.serviceAccount.name }}
       restartPolicy: Never
-      initContainers:
-        - name: git-clone
-          image: alpine/git:latest
-          imagePullPolicy: IfNotPresent
-          command: ["/bin/sh", "-c"]
-          args:
-            - |
-              set -e
-              echo "=========================================="
-              echo "Git Clone Started"
-              echo "=========================================="
-              echo "Repository: {{ .Values.git.repoUrl }}"
-              echo "Branch: {{ .Values.git.branch }}"
-              echo "Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
-              echo "=========================================="
-              
-              # Clone the repository
-              git clone --depth {{ .Values.git.depth }} --branch {{ .Values.git.branch }} {{ .Values.git.repoUrl }} /workspace/repo
-              
-              echo "Repository cloned successfully"
-              
-              # Verify bucket-contents folder exists
-              if [ ! -d "/workspace/repo/{{ .Values.git.bucketContentsPath }}" ]; then
-                echo "ERROR: bucket-contents folder not found at path: {{ .Values.git.bucketContentsPath }}"
-                exit 1
-              fi
-              
-              # Display directory structure
-              echo ""
-              echo "Directory structure in bucket-contents:"
-              cd /workspace/repo/{{ .Values.git.bucketContentsPath }}
-              find . -type f | sort
-              
-              echo ""
-              echo "Git clone completed successfully"
-          volumeMounts:
-            - name: workspace
-              mountPath: /workspace
-          resources:
-            requests:
-              memory: "128Mi"
-              cpu: "100m"
-            limits:
-              memory: "256Mi"
-              cpu: "200m"
-      
       containers:
-        - name: upload-to-gcs
-          image: google/cloud-sdk:alpine
-          imagePullPolicy: IfNotPresent
-          command: ["/bin/sh", "-c"]
-          args:
-            - |
-              set -e
-              
-              echo "=========================================="
-              echo "Schema Upload to GCS Started"
-              echo "=========================================="
-              echo "Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
-              echo "GCS Bucket: {{ .Values.gcs.bucketName }}"
-              echo "Base Folder: {{ .Values.gcs.baseFolder }}"
-              echo "Source Path: {{ .Values.git.bucketContentsPath }}"
-              echo "GCP Project: {{ .Values.gcs.projectId }}"
-              echo "=========================================="
-              
-              # Navigate to bucket-contents directory
-              cd /workspace/repo/{{ .Values.git.bucketContentsPath }}
-              
-              # Count total files
-              TOTAL_FILES=$(find . -type f | wc -l)
-              echo "Total files to upload: $TOTAL_FILES"
-              
-              if [ "$TOTAL_FILES" -eq 0 ]; then
-                echo "ERROR: No files found in {{ .Values.git.bucketContentsPath }}"
-                exit 1
-              fi
-              
-              # Display file structure
-              echo ""
-              echo "Files to be uploaded:"
-              find . -type f | sort
-              echo ""
-              
-              # Set GCS destination path
-              {{- if .Values.gcs.baseFolder }}
-              GCS_DESTINATION="gs://{{ .Values.gcs.bucketName }}/{{ .Values.gcs.baseFolder }}/"
-              {{- else }}
-              GCS_DESTINATION="gs://{{ .Values.gcs.bucketName }}/"
-              {{- end }}
-              
-              echo "Destination: $GCS_DESTINATION"
-              echo ""
-              echo "Starting upload with directory structure preservation..."
-              
-              # Upload files maintaining directory structure
-              # The -r flag with trailing /. ensures directory structure is maintained
-              gsutil -m rsync -r -d . "$GCS_DESTINATION"
-              
-              echo ""
-              echo "Upload completed. Verifying files in GCS..."
-              
-              # List uploaded files
-              echo ""
-              echo "Files in GCS bucket:"
-              gsutil ls -r "$GCS_DESTINATION"
-              
-              # Verify file count in GCS
-              GCS_FILE_COUNT=$(gsutil ls -r "$GCS_DESTINATION**" | grep -v "/$" | wc -l)
-              
-              echo ""
-              echo "=========================================="
-              echo "Upload Summary"
-              echo "=========================================="
-              echo "Local files processed: $TOTAL_FILES"
-              echo "Files in GCS: $GCS_FILE_COUNT"
-              echo "Destination: $GCS_DESTINATION"
-              echo "=========================================="
-              
-              if [ "$GCS_FILE_COUNT" -eq 0 ]; then
-                echo "ERROR: Upload verification failed - no files found in destination"
-                exit 1
-              fi
-              
-              echo ""
-              echo "Schema upload completed successfully!"
-              echo "Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+        - name: schema-uploader
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
-            - name: CLOUDSDK_CORE_PROJECT
+            - name: GCS_BUCKET_NAME
+              value: "{{ .Values.gcs.bucketName }}"
+            - name: GCP_PROJECT_ID
               value: "{{ .Values.gcs.projectId }}"
-          volumeMounts:
-            - name: workspace
-              mountPath: /workspace
+            - name: GCS_BASE_FOLDER
+              value: "{{ .Values.gcs.baseFolder }}"
+            - name: SOURCE_DIR
+              value: "/schemas"
           resources:
             {{- toYaml .Values.job.resources | nindent 12 }}
-      
-      volumes:
-        - name: workspace
-          emptyDir: {}
+"""
 
----
+# =============================================================================
+# HELM OVERRIDES - bld01-config.yaml
 # File: helm-overrides/bld01-config.yaml
-# Build/Development Environment Configuration
-
-git:
-  repoUrl: "https://github.com/your-org/your-schema-repo.git"
-  branch: "develop"
-  bucketContentsPath: "bucket-contents"
-  depth: 1
+# =============================================================================
+"""
+image:
+  repository: "gcr.io/your-project/schema-uploader"
+  tag: "latest"
+  pullPolicy: Always
 
 gcs:
   bucketName: "your-project-schemas-bld01"
@@ -303,16 +459,17 @@ job:
     limits:
       memory: "512Mi"
       cpu: "500m"
+"""
 
----
+# =============================================================================
+# HELM OVERRIDES - pre01-config.yaml
 # File: helm-overrides/pre01-config.yaml
-# Pre-Production Environment Configuration
-
-git:
-  repoUrl: "https://github.com/your-org/your-schema-repo.git"
-  branch: "release"
-  bucketContentsPath: "bucket-contents"
-  depth: 1
+# =============================================================================
+"""
+image:
+  repository: "gcr.io/your-project/schema-uploader"
+  tag: "latest"
+  pullPolicy: Always
 
 gcs:
   bucketName: "your-project-schemas-pre01"
@@ -333,7 +490,7 @@ labels:
 
 job:
   namePrefix: schema-copy-to-gcs
-  ttlSecondsAfterFinished: 7200  # 2 hours retention for pre-prod
+  ttlSecondsAfterFinished: 7200
   backoffLimit: 2
   resources:
     requests:
@@ -342,16 +499,17 @@ job:
     limits:
       memory: "512Mi"
       cpu: "500m"
+"""
 
----
+# =============================================================================
+# HELM OVERRIDES - prd01-config.yaml
 # File: helm-overrides/prd01-config.yaml
-# Production Environment Configuration
-
-git:
-  repoUrl: "https://github.com/your-org/your-schema-repo.git"
-  branch: "main"
-  bucketContentsPath: "bucket-contents"
-  depth: 1
+# =============================================================================
+"""
+image:
+  repository: "gcr.io/your-project/schema-uploader"
+  tag: "v1.0.0"  # Use specific version tags in production
+  pullPolicy: IfNotPresent
 
 gcs:
   bucketName: "your-project-schemas-prd01"
@@ -372,8 +530,8 @@ labels:
 
 job:
   namePrefix: schema-copy-to-gcs
-  ttlSecondsAfterFinished: 86400  # 24 hours retention for production
-  backoffLimit: 1  # Fail fast in production
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 1
   resources:
     requests:
       memory: "512Mi"
@@ -381,20 +539,47 @@ job:
     limits:
       memory: "1Gi"
       cpu: "1000m"
+"""
 
----
-# File: SETUP-GUIDE.md
-# Schema Upload to GCS - Setup Guide
+# =============================================================================
+# .dockerignore
+# File: .dockerignore
+# =============================================================================
+"""
+.git
+.gitignore
+*.md
+helm-chart/
+helm-overrides/
+.github/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+"""
+
+# =============================================================================
+# BUILD AND DEPLOYMENT GUIDE
+# File: BUILD-DEPLOYMENT-GUIDE.md
+# =============================================================================
+"""
+# Schema Uploader - Build and Deployment Guide
 
 ## Repository Structure
 
 ```
 your-repo/
-├── bucket-contents/           # Source files to upload
+├── bucket-contents/              # Schema files to upload
 │   ├── version1_0/
 │   │   └── uapi_schema.json
 │   └── version2_0/
 │       └── uapi_schema.json
+├── copy_schemas_to_gcs.py        # Python upload script
+├── requirements.txt              # Python dependencies
+├── Dockerfile                    # Docker image definition
+├── .dockerignore                 # Docker ignore patterns
 ├── helm-chart/
 │   └── schema-upload-files/
 │       ├── Chart.yaml
@@ -408,80 +593,182 @@ your-repo/
     └── prd01-config.yaml
 ```
 
-## Workload Identity Setup (Per Environment)
+## Local Development and Testing
 
-### 1. Create GCP Service Account
+### 1. Test Python Script Locally
 ```bash
-export ENV="bld01"  # or pre01, prd01
-export GCP_PROJECT="your-gcp-project-${ENV}"
-export K8S_NAMESPACE="schema-upload"
+# Install dependencies
+pip install -r requirements.txt
 
-gcloud iam service-accounts create gcs-schema-copy-sa \
-    --display-name="Schema Copy to GCS Service Account - ${ENV}" \
-    --project=${GCP_PROJECT}
+# Set environment variables
+export GCS_BUCKET_NAME="your-test-bucket"
+export GCP_PROJECT_ID="your-project-id"
+export GCS_BASE_FOLDER="test-schemas"
+export SOURCE_DIR="./bucket-contents"
+
+# Run the script
+python copy_schemas_to_gcs.py
 ```
 
-### 2. Grant GCS Permissions
+### 2. Build Docker Image
 ```bash
-# For specific bucket
-gcloud storage buckets add-iam-policy-binding gs://your-bucket-name-${ENV} \
-    --member="serviceAccount:gcs-schema-copy-sa@${GCP_PROJECT}.iam.gserviceaccount.com" \
-    --role="roles/storage.objectAdmin"
+# Build the image
+docker build -t schema-uploader:test .
 
-# OR for project-wide access
-gcloud projects add-iam-policy-binding ${GCP_PROJECT} \
-    --member="serviceAccount:gcs-schema-copy-sa@${GCP_PROJECT}.iam.gserviceaccount.com" \
-    --role="roles/storage.objectAdmin"
+# Test the image locally (requires GCP credentials)
+docker run --rm \
+  -e GCS_BUCKET_NAME="your-test-bucket" \
+  -e GCP_PROJECT_ID="your-project-id" \
+  -e GCS_BASE_FOLDER="test-schemas" \
+  -v ~/.config/gcloud:/root/.config/gcloud \
+  schema-uploader:test
 ```
 
-### 3. Setup Workload Identity Binding
-```bash
-gcloud iam service-accounts add-iam-policy-binding \
-    gcs-schema-copy-sa@${GCP_PROJECT}.iam.gserviceaccount.com \
-    --role roles/iam.workloadIdentityUser \
-    --member "serviceAccount:${GCP_PROJECT}.svc.id.goog[${K8S_NAMESPACE}/gcs-schema-copy-sa]"
+## Harness Pipeline Configuration
+
+### Stage 1: Build Docker Image
+
+```yaml
+- stage:
+    name: Build Schema Uploader Image
+    identifier: build_image
+    type: CI
+    spec:
+      cloneCodebase: true
+      platform:
+        os: Linux
+        arch: Amd64
+      runtime:
+        type: Cloud
+        spec: {}
+      execution:
+        steps:
+          - step:
+              type: BuildAndPushDockerRegistry
+              name: Build and Push Image
+              identifier: build_push
+              spec:
+                connectorRef: <your_docker_registry_connector>
+                repo: gcr.io/your-project/schema-uploader
+                tags:
+                  - <+pipeline.sequenceId>
+                  - <+pipeline.variables.image_tag>
+                  - latest
+                dockerfile: Dockerfile
+                context: .
+                labels:
+                  version: <+pipeline.variables.image_tag>
+                  build-number: <+pipeline.sequenceId>
+              timeout: 10m
 ```
 
-### 4. Create Kubernetes Service Account (via Helm or manually)
-```bash
-# This is handled by Helm chart, but you can verify:
-kubectl get serviceaccount gcs-schema-copy-sa -n ${K8S_NAMESPACE}
+### Stage 2: Deploy to Kubernetes
+
+```yaml
+- stage:
+    name: Deploy Schema Uploader
+    identifier: deploy
+    type: Deployment
+    spec:
+      deploymentType: Kubernetes
+      service:
+        serviceRef: schema_upload_service
+        serviceInputs:
+          serviceDefinition:
+            type: Kubernetes
+            spec:
+              variables:
+                - name: image_tag
+                  type: String
+                  value: <+pipeline.stages.build_image.spec.execution.steps.build_push.output.outputVariables.tag>
+      environment:
+        environmentRef: <+input>
+        deployToAll: false
+        infrastructureDefinitions:
+          - identifier: <+input>
+      execution:
+        steps:
+          - step:
+              name: Deploy Helm Chart
+              identifier: helm_deploy
+              type: HelmDeploy
+              timeout: 10m
+              spec:
+                chartPath: helm-chart/schema-upload-files
+                helmVersion: V3
+                valuesPaths:
+                  - helm-overrides/<+env.name>-config.yaml
+                commandFlags:
+                  - --set image.tag=<+pipeline.stages.build_image.spec.execution.steps.build_push.output.outputVariables.tag>
+                skipDryRun: false
+          
+          - step:
+              name: Wait for Job Completion
+              identifier: wait_job
+              type: ShellScript
+              timeout: 30m
+              spec:
+                shell: Bash
+                onDelegate: true
+                source:
+                  type: Inline
+                  spec:
+                    script: |
+                      #!/bin/bash
+                      set -e
+                      
+                      NAMESPACE="<+infra.namespace>"
+                      JOB_LABEL="job-type=schema-upload"
+                      
+                      echo "Waiting for job completion..."
+                      kubectl wait --for=condition=complete \
+                        --timeout=30m \
+                        -n ${NAMESPACE} \
+                        job -l ${JOB_LABEL}
+                      
+                      echo "Job completed successfully!"
+          
+          - step:
+              name: Get Job Logs
+              identifier: get_logs
+              type: ShellScript
+              timeout: 5m
+              spec:
+                shell: Bash
+                onDelegate: true
+                source:
+                  type: Inline
+                  spec:
+                    script: |
+                      #!/bin/bash
+                      NAMESPACE="<+infra.namespace>"
+                      POD_NAME=$(kubectl get pods -n ${NAMESPACE} -l job-type=schema-upload -o jsonpath='{.items[0].metadata.name}')
+                      
+                      echo "=== Job Logs ==="
+                      kubectl logs -n ${NAMESPACE} ${POD_NAME}
+        rollbackSteps: []
 ```
 
-## Deployment with Existing Harness Template
+## Manual Deployment Steps
 
-### Using Harness Helm Deployment Template
+### 1. Build and Push Image
+```bash
+# Build
+docker build -t gcr.io/your-project/schema-uploader:v1.0.0 .
 
-1. **Create Service in Harness:**
-   - Service Name: `schema-upload-files`
-   - Deployment Type: `Kubernetes`
-   - Add Helm chart from your Git repository
+# Push
+docker push gcr.io/your-project/schema-uploader:v1.0.0
+```
 
-2. **Configure Manifest:**
-   - Chart Path: `helm-chart/schema-upload-files`
-   - Values YAML Path: `helm-chart/schema-upload-files/values.yaml`
-
-3. **Add Environment-Specific Overrides:**
-   - For BLD01: `helm-overrides/bld01-config.yaml`
-   - For PRE01: `helm-overrides/pre01-config.yaml`
-   - For PRD01: `helm-overrides/prd01-config.yaml`
-
-4. **Pipeline Execution:**
-   - Your existing Helm deployment template will:
-     - Pull the Helm chart
-     - Apply environment-specific overrides
-     - Deploy the job to the target cluster
-     - Wait for job completion (if configured)
-
-## Testing the Setup
-
-### Manual Helm Deployment Test
+### 2. Deploy with Helm
 ```bash
 # Deploy to BLD01
 helm upgrade --install schema-upload \
-    ./helm-chart/schema-upload-files \
-    -f helm-overrides/bld01-config.yaml \
-    -n schema-upload
+  ./helm-chart/schema-upload-files \
+  -f helm-overrides/bld01-config.yaml \
+  --set image.tag=v1.0.0 \
+  -n schema-upload \
+  --create-namespace
 
 # Check job status
 kubectl get jobs -n schema-upload
@@ -490,96 +777,80 @@ kubectl get jobs -n schema-upload
 kubectl logs -n schema-upload -l job-type=schema-upload --tail=100 -f
 ```
 
-### Verify in GCS
+### 3. Verify in GCS
 ```bash
-# List files in bucket
-gsutil ls -r gs://your-bucket-name-bld01/schemas/
-
-# Should show structure like:
-# gs://your-bucket-name-bld01/schemas/version1_0/uapi_schema.json
-# gs://your-bucket-name-bld01/schemas/version2_0/uapi_schema.json
+gsutil ls -r gs://your-project-schemas-bld01/schemas/
 ```
 
-## Directory Structure Preservation
+## Python Script Features
 
-The job uses `gsutil rsync` which maintains the exact directory structure from `bucket-contents/`:
+✅ **Preserves directory structure** - Maintains exact folder hierarchy  
+✅ **Detailed logging** - Shows progress and errors clearly  
+✅ **Verification** - Confirms all files uploaded successfully  
+✅ **Error handling** - Graceful failure with proper exit codes  
+✅ **Workload Identity** - No credentials needed in container  
+✅ **Environment-based config** - All settings via env vars  
 
-**Source (Git repo):**
+## Example Output
+
 ```
-bucket-contents/
-├── version1_0/
-│   └── uapi_schema.json
-└── version2_0/
-    └── uapi_schema.json
+2024-11-13 10:15:30 - INFO - Initialized uploader for bucket: my-schemas-bld01
+2024-11-13 10:15:30 - INFO - GCP Project: my-project-bld01
+2024-11-13 10:15:30 - INFO - Base folder: schemas
+2024-11-13 10:15:30 - INFO - ============================================================
+2024-11-13 10:15:30 - INFO - Starting Schema Upload Process
+2024-11-13 10:15:30 - INFO - ============================================================
+2024-11-13 10:15:30 - INFO - Found 2 files to upload
+2024-11-13 10:15:30 - INFO - 
+2024-11-13 10:15:30 - INFO - Directory structure:
+2024-11-13 10:15:30 - INFO -   version1_0/uapi_schema.json
+2024-11-13 10:15:30 - INFO -   version2_0/uapi_schema.json
+2024-11-13 10:15:30 - INFO - 
+2024-11-13 10:15:31 - INFO - ✓ Uploaded: uapi_schema.json -> gs://my-schemas-bld01/schemas/version1_0/uapi_schema.json
+2024-11-13 10:15:31 - INFO - ✓ Uploaded: uapi_schema.json -> gs://my-schemas-bld01/schemas/version2_0/uapi_schema.json
+2024-11-13 10:15:31 - INFO - 
+2024-11-13 10:15:31 - INFO - ============================================================
+2024-11-13 10:15:31 - INFO - Verifying Upload
+2024-11-13 10:15:31 - INFO - ============================================================
+2024-11-13 10:15:32 - INFO - Files in GCS (gs://my-schemas-bld01/schemas/):
+2024-11-13 10:15:32 - INFO -   version1_0/uapi_schema.json
+2024-11-13 10:15:32 - INFO -   version2_0/uapi_schema.json
+2024-11-13 10:15:32 - INFO - 
+2024-11-13 10:15:32 - INFO - ✓ Verification successful!
+2024-11-13 10:15:32 - INFO - 
+2024-11-13 10:15:32 - INFO - ============================================================
+2024-11-13 10:15:32 - INFO - Upload Summary
+2024-11-13 10:15:32 - INFO - ============================================================
+2024-11-13 10:15:32 - INFO - Total files processed: 2
+2024-11-13 10:15:32 - INFO - Successful uploads: 2
+2024-11-13 10:15:32 - INFO - Failed uploads: 0
+2024-11-13 10:15:32 - INFO - Duration: 2.15 seconds
+2024-11-13 10:15:32 - INFO - Destination: gs://my-schemas-bld01/schemas
+2024-11-13 10:15:32 - INFO - ============================================================
+2024-11-13 10:15:32 - INFO - 
+2024-11-13 10:15:32 - INFO - ✓ Schema upload completed successfully!
 ```
-
-**Destination (GCS):**
-```
-gs://bucket/schemas/
-├── version1_0/
-│   └── uapi_schema.json
-└── version2_0/
-    └── uapi_schema.json
-```
-
-## Configuration Options
-
-### Repository-Specific Configuration
-Each repository can have different structure in `bucket-contents/`. The job will preserve whatever structure exists:
-
-```yaml
-# Repo A: Simple structure
-bucket-contents/
-└── schemas/
-    └── main.json
-
-# Repo B: Versioned structure  
-bucket-contents/
-├── v1/
-│   └── schema.json
-└── v2/
-    └── schema.json
-
-# Repo C: Complex nested structure
-bucket-contents/
-├── service-a/
-│   ├── dev/
-│   └── prod/
-└── service-b/
-    └── schemas/
-```
-
-All structures will be preserved as-is when uploaded to GCS.
 
 ## Troubleshooting
 
-### View Job Logs
+### Check Image Build
 ```bash
-kubectl logs -n schema-upload -l job-type=schema-upload
+docker run --rm schema-uploader:test python3 --version
+docker run --rm schema-uploader:test ls -la /schemas
 ```
 
-### Check Service Account Permissions
+### Test Workload Identity
 ```bash
-# Test from within cluster
 kubectl run -it --rm test-wi \
     --image=google/cloud-sdk:alpine \
     --serviceaccount=gcs-schema-copy-sa \
     -n schema-upload \
-    -- gsutil ls gs://your-bucket-name/
+    -- gsutil ls gs://your-bucket/
 ```
 
-### Common Issues
-
-1. **"Permission denied" errors:**
-   - Verify Workload Identity binding
-   - Check GCS bucket permissions
-   - Ensure service account annotation is correct
-
-2. **"bucket-contents folder not found":**
-   - Verify path in values.yaml matches your repo structure
-   - Check git branch configuration
-
-3. **Job keeps restarting:**
-   - Check resource limits
-   - Review logs for errors
-   - Verify bucket name and project ID
+### Debug Job Failures
+```bash
+kubectl describe job -n schema-upload -l job-type=schema-upload
+kubectl logs -n schema-upload -l job-type=schema-upload
+```
+"""
