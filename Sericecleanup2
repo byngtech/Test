@@ -1,0 +1,206 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: service-cleaner
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: service-cleaner-role
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "delete"]
+- apiGroups: [""]
+  resources: ["services", "endpoints"]
+  verbs: ["get", "list", "delete"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: service-cleaner-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: service-cleaner-role
+subjects:
+- kind: ServiceAccount
+  name: service-cleaner
+  namespace: default
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: service-cleaner-script
+  namespace: default
+data:
+  cleanup.sh: |
+    #!/bin/bash
+    set -e
+    
+    # Configuration
+    IDLE_THRESHOLD_MINUTES=${IDLE_THRESHOLD_MINUTES:-60}
+    DRY_RUN=${DRY_RUN:-false}
+    NAMESPACE_PREFIX=${NAMESPACE_PREFIX:-ns-kcl-tnt01-ecp}
+    EXCLUDE_LABELS=${EXCLUDE_LABELS:-""}
+    
+    echo "Starting service cleanup process..."
+    echo "Namespace prefix: $NAMESPACE_PREFIX"
+    echo "Idle threshold: $IDLE_THRESHOLD_MINUTES minutes"
+    echo "Dry run: $DRY_RUN"
+    
+    # Get all namespaces matching the prefix
+    NAMESPACES=$(kubectl get namespaces -o json | jq -r ".items[].metadata.name | select(startswith(\"$NAMESPACE_PREFIX\"))")
+    
+    if [ -z "$NAMESPACES" ]; then
+      echo "No namespaces found matching prefix: $NAMESPACE_PREFIX"
+      exit 0
+    fi
+    
+    echo "Found namespaces:"
+    echo "$NAMESPACES"
+    echo ""
+    
+    # Process each namespace
+    echo "$NAMESPACES" | while read NAMESPACE; do
+      echo "=========================================="
+      echo "Processing namespace: $NAMESPACE"
+      echo "=========================================="
+      
+      # Get all services in namespace
+      SERVICES=$(kubectl get services -n $NAMESPACE -o json)
+    
+    # Check each service for activity
+    echo "$SERVICES" | jq -r '.items[] | select(.metadata.name != "kubernetes") | .metadata.name' | while read SERVICE_NAME; do
+      
+      # Skip if service has exclude label
+      if [ ! -z "$EXCLUDE_LABELS" ]; then
+        LABELS=$(kubectl get service $SERVICE_NAME -n $NAMESPACE -o jsonpath='{.metadata.labels}')
+        if echo "$LABELS" | grep -q "$EXCLUDE_LABELS"; then
+          echo "Skipping $SERVICE_NAME (excluded by label)"
+          continue
+        fi
+      fi
+      
+      echo "Checking service: $SERVICE_NAME"
+        
+        # Check if service has active endpoints
+        ENDPOINTS=$(kubectl get endpoints $SERVICE_NAME -n $NAMESPACE -o json 2>/dev/null || echo '{}')
+        READY_ADDRESSES=$(echo "$ENDPOINTS" | jq -r '.subsets[]?.addresses // [] | length' 2>/dev/null || echo "0")
+        
+        if [ "$READY_ADDRESSES" = "0" ]; then
+          echo "  → No ready endpoints found"
+          SHOULD_DELETE=true
+        else
+          echo "  → Has $READY_ADDRESSES ready endpoints"
+          
+          # Check pod activity via last restart time
+          PODS=$(kubectl get pods -n $NAMESPACE -l "$(kubectl get service $SERVICE_NAME -n $NAMESPACE -o jsonpath='{.spec.selector}' | jq -r 'to_entries | map("\(.key)=\(.value)") | join(",")')" -o json 2>/dev/null || echo '{"items":[]}')
+          
+          RECENT_ACTIVITY=false
+          echo "$PODS" | jq -r '.items[].status.containerStatuses[]?.state.running.startedAt // empty' | while read START_TIME; do
+            if [ ! -z "$START_TIME" ]; then
+              START_EPOCH=$(date -d "$START_TIME" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%SZ" "$START_TIME" +%s 2>/dev/null || echo "0")
+              CURRENT_EPOCH=$(date +%s)
+              AGE_MINUTES=$(( ($CURRENT_EPOCH - $START_EPOCH) / 60 ))
+              
+              if [ $AGE_MINUTES -lt $IDLE_THRESHOLD_MINUTES ]; then
+                RECENT_ACTIVITY=true
+                break
+              fi
+            fi
+          done
+          
+          # Check service age as fallback
+          SERVICE_AGE=$(kubectl get service $SERVICE_NAME -n $NAMESPACE -o jsonpath='{.metadata.creationTimestamp}')
+          SERVICE_EPOCH=$(date -d "$SERVICE_AGE" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%SZ" "$SERVICE_AGE" +%s 2>/dev/null || echo "0")
+          CURRENT_EPOCH=$(date +%s)
+          SERVICE_AGE_MINUTES=$(( ($CURRENT_EPOCH - $SERVICE_EPOCH) / 60 ))
+          
+          if [ $SERVICE_AGE_MINUTES -lt $IDLE_THRESHOLD_MINUTES ]; then
+            echo "  → Service is too new to delete (${SERVICE_AGE_MINUTES}m old)"
+            SHOULD_DELETE=false
+          elif [ "$RECENT_ACTIVITY" = "true" ]; then
+            echo "  → Recent activity detected"
+            SHOULD_DELETE=false
+          else
+            echo "  → No recent activity detected"
+            SHOULD_DELETE=true
+          fi
+        fi
+        
+        # Delete service and associated deployment
+        if [ "$SHOULD_DELETE" = "true" ]; then
+          echo "  → Marking for deletion: $SERVICE_NAME"
+          
+          if [ "$DRY_RUN" = "false" ]; then
+            # Delete associated deployment
+            DEPLOYMENT=$(kubectl get deployment -n $NAMESPACE --selector="$(kubectl get service $SERVICE_NAME -n $NAMESPACE -o jsonpath='{.spec.selector}' | jq -r 'to_entries | map("\(.key)=\(.value)") | join(",")')" -o name 2>/dev/null | head -1)
+            
+            if [ ! -z "$DEPLOYMENT" ]; then
+              echo "  → Deleting deployment: $DEPLOYMENT"
+              kubectl delete $DEPLOYMENT -n $NAMESPACE
+            fi
+            
+            echo "  → Deleting service: $SERVICE_NAME"
+            kubectl delete service $SERVICE_NAME -n $NAMESPACE
+          else
+            echo "  → DRY RUN: Would delete service and deployment"
+          fi
+        else
+          echo "  → Keeping service: $SERVICE_NAME"
+        fi
+        
+        echo ""
+      done
+      
+      echo ""
+    done
+    
+    echo "Cleanup process completed"
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: service-cleaner
+  namespace: default
+spec:
+  # Run every 30 minutes
+  schedule: "*/30 * * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: service-cleaner
+          restartPolicy: OnFailure
+          containers:
+          - name: cleaner
+            image: bitnami/kubectl:latest
+            env:
+            - name: IDLE_THRESHOLD_MINUTES
+              value: "60"  # Remove services idle for 60+ minutes
+            - name: DRY_RUN
+              value: "false"  # Set to "true" for testing
+            - name: NAMESPACE_PREFIX
+              value: "ns-kcl-tnt01-ecp"  # Will process all namespaces starting with this
+            - name: EXCLUDE_LABELS
+              value: "keep=true"  # Services with this label won't be deleted
+            command:
+            - /bin/bash
+            - /scripts/cleanup.sh
+            volumeMounts:
+            - name: script
+              mountPath: /scripts
+          volumes:
+          - name: script
+            configMap:
+              name: service-cleaner-script
+              defaultMode: 0755
