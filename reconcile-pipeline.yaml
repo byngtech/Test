@@ -1,0 +1,287 @@
+pipeline:
+  name: Reconcile Pipeline Templates
+  identifier: reconcile_pipeline_templates
+  projectIdentifier: <+input>   # e.g. apisample
+  orgIdentifier: <+input>       # e.g. default
+  tags: {}
+  variables:
+    - name: git_owner
+      type: String
+      description: "GitHub org/user that owns the repo where pipelines are Git-synced"
+      required: true
+      value: <+input>
+    - name: git_repo
+      type: String
+      description: "Repo name where pipeline YAML lives (Harness Git Experience repo)"
+      required: true
+      value: <+input>
+    - name: git_base_branch
+      type: String
+      description: "Default branch to diff against and branch off of"
+      required: true
+      value: main
+    - name: slack_webhook_url
+      type: String
+      description: "Optional Slack incoming webhook for the run summary. Leave as <+input> default empty string if unused."
+      required: false
+      value: ""
+  stages:
+    - stage:
+        name: Reconcile Templates
+        identifier: reconcile_templates
+        description: "Finds pipelines whose linked templates have drifted, and opens a PR with the reconciled YAML"
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - step:
+                  type: ShellScript
+                  name: Reconcile and Open PRs
+                  identifier: reconcile_and_open_prs
+                  timeout: 30m
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    source:
+                      type: Inline
+                      spec:
+                        script: |-
+                          #!/bin/bash
+                          set -euo pipefail
+
+                          # ---------------------------------------------------------------
+                          # Config (injected via environment variables below)
+                          # ---------------------------------------------------------------
+                          : "${HARNESS_API_KEY:?missing}"
+                          : "${ACCOUNT_ID:?missing}"
+                          : "${ORG_ID:?missing}"
+                          : "${PROJECT_ID:?missing}"
+                          : "${GIT_TOKEN:?missing}"
+                          : "${GIT_OWNER:?missing}"
+                          : "${GIT_REPO:?missing}"
+                          : "${GIT_BASE_BRANCH:?missing}"
+
+                          HARNESS_BASE="https://app.harness.io"
+                          GITHUB_API="https://api.github.com"
+                          SUMMARY_FILE=$(mktemp)
+                          echo "Reconciliation run: $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SUMMARY_FILE"
+
+                          # Make sure jq is available (most delegate images ship it; fall back to apt if not)
+                          if ! command -v jq >/dev/null 2>&1; then
+                            echo "jq not found, attempting install..."
+                            (apt-get update -qq && apt-get install -y -qq jq) || {
+                              echo "ERROR: jq is required but could not be installed on this delegate. Add it to a custom delegate image." >&2
+                              exit 1
+                            }
+                          fi
+
+                          # ---------------------------------------------------------------
+                          # 1. List pipelines in the project (paginated), keep Git-backed ones
+                          # ---------------------------------------------------------------
+                          echo "Fetching pipeline list for org=$ORG_ID project=$PROJECT_ID ..."
+                          page=0
+                          limit=100
+                          all_pipelines="[]"
+
+                          while true; do
+                            resp=$(curl -s -X GET \
+                              "${HARNESS_BASE}/v1/orgs/${ORG_ID}/projects/${PROJECT_ID}/pipelines?page=${page}&limit=${limit}" \
+                              -H "Harness-Account: ${ACCOUNT_ID}" \
+                              -H "x-api-key: ${HARNESS_API_KEY}")
+
+                            count=$(echo "$resp" | jq 'length')
+                            if [ "$count" -eq 0 ]; then
+                              break
+                            fi
+
+                            all_pipelines=$(jq -s '.[0] + .[1]' <(echo "$all_pipelines") <(echo "$resp"))
+                            page=$((page + 1))
+
+                            if [ "$count" -lt "$limit" ]; then
+                              break
+                            fi
+                          done
+
+                          remote_ids=$(echo "$all_pipelines" | jq -r '.[] | select(.git_details.store_type=="REMOTE") | .identifier')
+
+                          if [ -z "$remote_ids" ]; then
+                            echo "No Git-backed (Remote) pipelines found in this project. Nothing to reconcile."
+                            cat "$SUMMARY_FILE"
+                            exit 0
+                          fi
+
+                          echo "Found remote pipelines:"
+                          echo "$remote_ids"
+                          echo "---"
+
+                          # ---------------------------------------------------------------
+                          # Helper: base64 encode without line wrapping (portable)
+                          # ---------------------------------------------------------------
+                          b64() { base64 -w0 2>/dev/null || base64; }
+
+                          out_of_sync_count=0
+
+                          # ---------------------------------------------------------------
+                          # 2. For each pipeline: fetch current + refreshed YAML, diff, and
+                          #    if different, push a branch + open a PR
+                          # ---------------------------------------------------------------
+                          for pid in $remote_ids; do
+                            echo "== Checking pipeline: $pid =="
+
+                            pipeline_detail=$(curl -s -X GET \
+                              "${HARNESS_BASE}/v1/orgs/${ORG_ID}/projects/${PROJECT_ID}/pipelines/${pid}" \
+                              -H "Harness-Account: ${ACCOUNT_ID}" \
+                              -H "x-api-key: ${HARNESS_API_KEY}")
+
+                            current_yaml=$(echo "$pipeline_detail" | jq -r '.pipeline_yaml')
+                            file_path=$(echo "$pipeline_detail" | jq -r '.git_details.file_path // empty')
+                            branch_of_pipeline=$(echo "$pipeline_detail" | jq -r '.git_details.branch_name // empty')
+
+                            if [ -z "$file_path" ]; then
+                              echo "  WARN: could not determine file_path for $pid, skipping."
+                              echo "$pid: SKIPPED (no file_path found)" >> "$SUMMARY_FILE"
+                              continue
+                            fi
+
+                            refresh_resp=$(curl -s -X POST \
+                              "${HARNESS_BASE}/template/api/refresh-template/refreshed-yaml?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${ORG_ID}&projectIdentifier=${PROJECT_ID}&pipelineIdentifier=${pid}" \
+                              -H "x-api-key: ${HARNESS_API_KEY}")
+
+                            refreshed_yaml=$(echo "$refresh_resp" | jq -r '.data.refreshedYaml // empty')
+
+                            if [ -z "$refreshed_yaml" ]; then
+                              echo "  INFO: no refreshed YAML returned (likely already in sync, or no templates referenced). Skipping."
+                              echo "$pid: in sync" >> "$SUMMARY_FILE"
+                              continue
+                            fi
+
+                            if [ "$current_yaml" == "$refreshed_yaml" ]; then
+                              echo "  Pipeline $pid is in sync with its templates."
+                              echo "$pid: in sync" >> "$SUMMARY_FILE"
+                              continue
+                            fi
+
+                            echo "  Pipeline $pid is OUT OF SYNC. Preparing a PR..."
+                            out_of_sync_count=$((out_of_sync_count + 1))
+
+                            new_branch="reconcile/${pid}-$(date +%Y%m%d%H%M%S)"
+
+                            # --- Get base branch SHA ---
+                            base_ref=$(curl -s -X GET \
+                              "${GITHUB_API}/repos/${GIT_OWNER}/${GIT_REPO}/git/ref/heads/${GIT_BASE_BRANCH}" \
+                              -H "Authorization: token ${GIT_TOKEN}")
+                            base_sha=$(echo "$base_ref" | jq -r '.object.sha // empty')
+
+                            if [ -z "$base_sha" ]; then
+                              echo "  ERROR: could not resolve base branch SHA for ${GIT_BASE_BRANCH}. Response: $base_ref"
+                              echo "$pid: FAILED (could not resolve base branch)" >> "$SUMMARY_FILE"
+                              continue
+                            fi
+
+                            # --- Create new branch off base ---
+                            create_branch_resp=$(curl -s -X POST \
+                              "${GITHUB_API}/repos/${GIT_OWNER}/${GIT_REPO}/git/refs" \
+                              -H "Authorization: token ${GIT_TOKEN}" \
+                              -d "{\"ref\": \"refs/heads/${new_branch}\", \"sha\": \"${base_sha}\"}")
+
+                            branch_ok=$(echo "$create_branch_resp" | jq -r '.ref // empty')
+                            if [ -z "$branch_ok" ]; then
+                              echo "  ERROR: could not create branch ${new_branch}. Response: $create_branch_resp"
+                              echo "$pid: FAILED (branch creation)" >> "$SUMMARY_FILE"
+                              continue
+                            fi
+
+                            # --- Get current file SHA on the new branch (needed to update it) ---
+                            file_meta=$(curl -s -X GET \
+                              "${GITHUB_API}/repos/${GIT_OWNER}/${GIT_REPO}/contents/${file_path}?ref=${new_branch}" \
+                              -H "Authorization: token ${GIT_TOKEN}")
+                            file_sha=$(echo "$file_meta" | jq -r '.sha // empty')
+
+                            if [ -z "$file_sha" ]; then
+                              echo "  ERROR: could not find file ${file_path} on branch ${new_branch}. Response: $file_meta"
+                              echo "$pid: FAILED (file lookup)" >> "$SUMMARY_FILE"
+                              continue
+                            fi
+
+                            encoded_content=$(printf '%s' "$refreshed_yaml" | b64)
+
+                            update_resp=$(curl -s -X PUT \
+                              "${GITHUB_API}/repos/${GIT_OWNER}/${GIT_REPO}/contents/${file_path}" \
+                              -H "Authorization: token ${GIT_TOKEN}" \
+                              -d "{\"message\": \"Reconcile pipeline ${pid} with latest template version\", \"content\": \"${encoded_content}\", \"sha\": \"${file_sha}\", \"branch\": \"${new_branch}\"}")
+
+                            commit_ok=$(echo "$update_resp" | jq -r '.commit.sha // empty')
+                            if [ -z "$commit_ok" ]; then
+                              echo "  ERROR: could not commit reconciled YAML. Response: $update_resp"
+                              echo "$pid: FAILED (commit)" >> "$SUMMARY_FILE"
+                              continue
+                            fi
+
+                            # --- Open the PR ---
+                            pr_body="Automated template reconciliation for pipeline \`${pid}\`.\n\nThis PR updates the pipeline YAML to match the latest version of its referenced org/account-level templates. Generated by the Reconcile Pipeline Templates job on $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+                            pr_resp=$(curl -s -X POST \
+                              "${GITHUB_API}/repos/${GIT_OWNER}/${GIT_REPO}/pulls" \
+                              -H "Authorization: token ${GIT_TOKEN}" \
+                              -d "{\"title\": \"Reconcile pipeline: ${pid}\", \"head\": \"${new_branch}\", \"base\": \"${GIT_BASE_BRANCH}\", \"body\": \"${pr_body}\"}")
+
+                            pr_url=$(echo "$pr_resp" | jq -r '.html_url // empty')
+
+                            if [ -z "$pr_url" ]; then
+                              echo "  ERROR: could not open PR. Response: $pr_resp"
+                              echo "$pid: FAILED (PR creation)" >> "$SUMMARY_FILE"
+                            else
+                              echo "  PR opened: $pr_url"
+                              echo "$pid: PR opened -> $pr_url" >> "$SUMMARY_FILE"
+                            fi
+                          done
+
+                          echo "---"
+                          echo "Reconciliation summary:"
+                          cat "$SUMMARY_FILE"
+
+                          # ---------------------------------------------------------------
+                          # 3. Optional Slack notification
+                          # ---------------------------------------------------------------
+                          if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
+                            summary_text=$(cat "$SUMMARY_FILE" | sed 's/"/\\"/g')
+                            curl -s -X POST "$SLACK_WEBHOOK_URL" \
+                              -H "Content-Type: application/json" \
+                              -d "{\"text\": \"*Pipeline Template Reconciliation*\n\`\`\`${summary_text}\`\`\`\"}" \
+                              > /dev/null || echo "WARN: Slack notification failed"
+                          fi
+
+                          if [ "$out_of_sync_count" -gt 0 ]; then
+                            echo "Done. ${out_of_sync_count} pipeline(s) needed reconciliation. See PR links above."
+                          else
+                            echo "Done. All pipelines already in sync."
+                          fi
+                    environmentVariables:
+                      - name: HARNESS_API_KEY
+                        type: String
+                        value: <+secrets.getValue("harness_api_key")>
+                      - name: ACCOUNT_ID
+                        type: String
+                        value: <+account.identifier>
+                      - name: ORG_ID
+                        type: String
+                        value: <+org.identifier>
+                      - name: PROJECT_ID
+                        type: String
+                        value: <+project.identifier>
+                      - name: GIT_TOKEN
+                        type: String
+                        value: <+secrets.getValue("git_pat_token")>
+                      - name: GIT_OWNER
+                        type: String
+                        value: <+pipeline.variables.git_owner>
+                      - name: GIT_REPO
+                        type: String
+                        value: <+pipeline.variables.git_repo>
+                      - name: GIT_BASE_BRANCH
+                        type: String
+                        value: <+pipeline.variables.git_base_branch>
+                      - name: SLACK_WEBHOOK_URL
+                        type: String
+                        value: <+pipeline.variables.slack_webhook_url>
+                    outputVariables: []
+        tags: {}

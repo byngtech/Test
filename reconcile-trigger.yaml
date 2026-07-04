@@ -1,0 +1,30 @@
+trigger:
+  name: weekly_template_reconciliation
+  identifier: weekly_template_reconciliation
+  enabled: true
+  orgIdentifier: <+input>          # match the pipeline's org
+  projectIdentifier: <+input>      # match the pipeline's project
+  pipelineIdentifier: reconcile_pipeline_templates
+  source:
+    type: Scheduled
+    spec:
+      type: Cron
+      spec:
+        # Every Monday at 6am UTC — adjust to taste (this is standard 5-field cron)
+        expression: "0 6 * * 1"
+  inputYaml: |
+    pipeline:
+      identifier: reconcile_pipeline_templates
+      variables:
+        - name: git_owner
+          type: String
+          value: your-github-org
+        - name: git_repo
+          type: String
+          value: your-harness-config-repo
+        - name: git_base_branch
+          type: String
+          value: main
+        - name: slack_webhook_url
+          type: String
+          value: ""
