@@ -7,19 +7,9 @@ pipeline:
   variables:
     - name: git_owner
       type: String
-      description: "GitHub org/user that owns the repo where pipelines are Git-synced"
+      description: "GitHub org/user that owns ALL repos this project's pipelines live in (one token covers all of them)"
       required: true
       value: <+input>
-    - name: git_repo
-      type: String
-      description: "Repo name where pipeline YAML lives (Harness Git Experience repo)"
-      required: true
-      value: <+input>
-    - name: git_base_branch
-      type: String
-      description: "Default branch to diff against and branch off of"
-      required: true
-      value: main
     - name: slack_webhook_url
       type: String
       description: "Optional Slack incoming webhook for the run summary. Leave as <+input> default empty string if unused."
@@ -58,8 +48,9 @@ pipeline:
                           : "${PROJECT_ID:?missing}"
                           : "${GIT_TOKEN:?missing}"
                           : "${GIT_OWNER:?missing}"
-                          : "${GIT_REPO:?missing}"
-                          : "${GIT_BASE_BRANCH:?missing}"
+                          # NOTE: repo name and base branch are NOT fixed globally.
+                          # Pipelines in this project can live in different repos, so both
+                          # are read per-pipeline from that pipeline's own git_details below.
 
                           HARNESS_BASE="https://app.harness.io"
                           GITHUB_API="https://api.github.com"
@@ -135,13 +126,18 @@ pipeline:
 
                             current_yaml=$(echo "$pipeline_detail" | jq -r '.pipeline_yaml')
                             file_path=$(echo "$pipeline_detail" | jq -r '.git_details.file_path // empty')
-                            branch_of_pipeline=$(echo "$pipeline_detail" | jq -r '.git_details.branch_name // empty')
+                            repo_name=$(echo "$pipeline_detail" | jq -r '.git_details.repo_name // empty')
+                            # Org policy: every repo's default branch is always "main",
+                            # so we don't need to read branch_name off git_details here.
+                            base_branch="main"
 
-                            if [ -z "$file_path" ]; then
-                              echo "  WARN: could not determine file_path for $pid, skipping."
-                              echo "$pid: SKIPPED (no file_path found)" >> "$SUMMARY_FILE"
+                            if [ -z "$file_path" ] || [ -z "$repo_name" ]; then
+                              echo "  WARN: could not determine file_path/repo_name for $pid, skipping."
+                              echo "$pid: SKIPPED (incomplete git_details)" >> "$SUMMARY_FILE"
                               continue
                             fi
+
+                            echo "  Repo: ${GIT_OWNER}/${repo_name}  Base branch: ${base_branch}  Path: ${file_path}"
 
                             refresh_resp=$(curl -s -X POST \
                               "${HARNESS_BASE}/template/api/refresh-template/refreshed-yaml?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${ORG_ID}&projectIdentifier=${PROJECT_ID}&pipelineIdentifier=${pid}" \
@@ -168,37 +164,37 @@ pipeline:
 
                             # --- Get base branch SHA ---
                             base_ref=$(curl -s -X GET \
-                              "${GITHUB_API}/repos/${GIT_OWNER}/${GIT_REPO}/git/ref/heads/${GIT_BASE_BRANCH}" \
+                              "${GITHUB_API}/repos/${GIT_OWNER}/${repo_name}/git/ref/heads/${base_branch}" \
                               -H "Authorization: token ${GIT_TOKEN}")
                             base_sha=$(echo "$base_ref" | jq -r '.object.sha // empty')
 
                             if [ -z "$base_sha" ]; then
-                              echo "  ERROR: could not resolve base branch SHA for ${GIT_BASE_BRANCH}. Response: $base_ref"
+                              echo "  ERROR: could not resolve base branch SHA for ${GIT_OWNER}/${repo_name}@${base_branch}. Response: $base_ref"
                               echo "$pid: FAILED (could not resolve base branch)" >> "$SUMMARY_FILE"
                               continue
                             fi
 
                             # --- Create new branch off base ---
                             create_branch_resp=$(curl -s -X POST \
-                              "${GITHUB_API}/repos/${GIT_OWNER}/${GIT_REPO}/git/refs" \
+                              "${GITHUB_API}/repos/${GIT_OWNER}/${repo_name}/git/refs" \
                               -H "Authorization: token ${GIT_TOKEN}" \
                               -d "{\"ref\": \"refs/heads/${new_branch}\", \"sha\": \"${base_sha}\"}")
 
                             branch_ok=$(echo "$create_branch_resp" | jq -r '.ref // empty')
                             if [ -z "$branch_ok" ]; then
-                              echo "  ERROR: could not create branch ${new_branch}. Response: $create_branch_resp"
+                              echo "  ERROR: could not create branch ${new_branch} in ${GIT_OWNER}/${repo_name}. Response: $create_branch_resp"
                               echo "$pid: FAILED (branch creation)" >> "$SUMMARY_FILE"
                               continue
                             fi
 
                             # --- Get current file SHA on the new branch (needed to update it) ---
                             file_meta=$(curl -s -X GET \
-                              "${GITHUB_API}/repos/${GIT_OWNER}/${GIT_REPO}/contents/${file_path}?ref=${new_branch}" \
+                              "${GITHUB_API}/repos/${GIT_OWNER}/${repo_name}/contents/${file_path}?ref=${new_branch}" \
                               -H "Authorization: token ${GIT_TOKEN}")
                             file_sha=$(echo "$file_meta" | jq -r '.sha // empty')
 
                             if [ -z "$file_sha" ]; then
-                              echo "  ERROR: could not find file ${file_path} on branch ${new_branch}. Response: $file_meta"
+                              echo "  ERROR: could not find file ${file_path} in ${GIT_OWNER}/${repo_name}@${new_branch}. Response: $file_meta"
                               echo "$pid: FAILED (file lookup)" >> "$SUMMARY_FILE"
                               continue
                             fi
@@ -206,13 +202,13 @@ pipeline:
                             encoded_content=$(printf '%s' "$refreshed_yaml" | b64)
 
                             update_resp=$(curl -s -X PUT \
-                              "${GITHUB_API}/repos/${GIT_OWNER}/${GIT_REPO}/contents/${file_path}" \
+                              "${GITHUB_API}/repos/${GIT_OWNER}/${repo_name}/contents/${file_path}" \
                               -H "Authorization: token ${GIT_TOKEN}" \
                               -d "{\"message\": \"Reconcile pipeline ${pid} with latest template version\", \"content\": \"${encoded_content}\", \"sha\": \"${file_sha}\", \"branch\": \"${new_branch}\"}")
 
                             commit_ok=$(echo "$update_resp" | jq -r '.commit.sha // empty')
                             if [ -z "$commit_ok" ]; then
-                              echo "  ERROR: could not commit reconciled YAML. Response: $update_resp"
+                              echo "  ERROR: could not commit reconciled YAML to ${GIT_OWNER}/${repo_name}. Response: $update_resp"
                               echo "$pid: FAILED (commit)" >> "$SUMMARY_FILE"
                               continue
                             fi
@@ -220,14 +216,14 @@ pipeline:
                             # --- Open the PR ---
                             pr_body="Automated template reconciliation for pipeline \`${pid}\`.\n\nThis PR updates the pipeline YAML to match the latest version of its referenced org/account-level templates. Generated by the Reconcile Pipeline Templates job on $(date -u +%Y-%m-%dT%H:%M:%SZ)."
                             pr_resp=$(curl -s -X POST \
-                              "${GITHUB_API}/repos/${GIT_OWNER}/${GIT_REPO}/pulls" \
+                              "${GITHUB_API}/repos/${GIT_OWNER}/${repo_name}/pulls" \
                               -H "Authorization: token ${GIT_TOKEN}" \
-                              -d "{\"title\": \"Reconcile pipeline: ${pid}\", \"head\": \"${new_branch}\", \"base\": \"${GIT_BASE_BRANCH}\", \"body\": \"${pr_body}\"}")
+                              -d "{\"title\": \"Reconcile pipeline: ${pid}\", \"head\": \"${new_branch}\", \"base\": \"${base_branch}\", \"body\": \"${pr_body}\"}")
 
                             pr_url=$(echo "$pr_resp" | jq -r '.html_url // empty')
 
                             if [ -z "$pr_url" ]; then
-                              echo "  ERROR: could not open PR. Response: $pr_resp"
+                              echo "  ERROR: could not open PR in ${GIT_OWNER}/${repo_name}. Response: $pr_resp"
                               echo "$pid: FAILED (PR creation)" >> "$SUMMARY_FILE"
                             else
                               echo "  PR opened: $pr_url"
@@ -274,12 +270,6 @@ pipeline:
                       - name: GIT_OWNER
                         type: String
                         value: <+pipeline.variables.git_owner>
-                      - name: GIT_REPO
-                        type: String
-                        value: <+pipeline.variables.git_repo>
-                      - name: GIT_BASE_BRANCH
-                        type: String
-                        value: <+pipeline.variables.git_base_branch>
                       - name: SLACK_WEBHOOK_URL
                         type: String
                         value: <+pipeline.variables.slack_webhook_url>

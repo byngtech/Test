@@ -19,12 +19,6 @@ trigger:
         - name: git_owner
           type: String
           value: your-github-org
-        - name: git_repo
-          type: String
-          value: your-harness-config-repo
-        - name: git_base_branch
-          type: String
-          value: main
         - name: slack_webhook_url
           type: String
           value: ""
