@@ -5,11 +5,6 @@ pipeline:
   orgIdentifier: <+input>       # e.g. default
   tags: {}
   variables:
-    - name: git_owner
-      type: String
-      description: "GitHub org/user that owns ALL repos this project's pipelines live in (one token covers all of them)"
-      required: true
-      value: <+input>
     - name: slack_webhook_url
       type: String
       description: "Optional Slack incoming webhook for the run summary. Leave as <+input> default empty string if unused."
@@ -47,10 +42,11 @@ pipeline:
                           : "${ORG_ID:?missing}"
                           : "${PROJECT_ID:?missing}"
                           : "${GIT_TOKEN:?missing}"
-                          : "${GIT_OWNER:?missing}"
-                          # NOTE: repo name and base branch are NOT fixed globally.
-                          # Pipelines in this project can live in different repos, so both
-                          # are read per-pipeline from that pipeline's own git_details below.
+                          # NOTE: repo, owner, and base branch are NOT fixed globally.
+                          # Pipelines in this project can live in different repos AND
+                          # different GitHub orgs, so all three are resolved per-pipeline
+                          # below (owner/repo via the pipeline's Git connector, branch is
+                          # hardcoded to "main" per org policy).
 
                           HARNESS_BASE="https://app.harness.io"
                           GITHUB_API="https://api.github.com"
@@ -110,6 +106,47 @@ pipeline:
                           # ---------------------------------------------------------------
                           b64() { base64 -w0 2>/dev/null || base64; }
 
+                          # ---------------------------------------------------------------
+                          # Helper: resolve a Harness connector_ref to a Harness connector
+                          # API call, honoring account./org./project scope prefixes
+                          # ---------------------------------------------------------------
+                          fetch_connector() {
+                            local connector_ref="$1"
+                            local conn_id="$connector_ref"
+                            local scope_qp=""
+
+                            if [[ "$connector_ref" == account.* ]]; then
+                              conn_id="${connector_ref#account.}"
+                              scope_qp="accountIdentifier=${ACCOUNT_ID}"
+                            elif [[ "$connector_ref" == org.* ]]; then
+                              conn_id="${connector_ref#org.}"
+                              scope_qp="accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${ORG_ID}"
+                            else
+                              scope_qp="accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${ORG_ID}&projectIdentifier=${PROJECT_ID}"
+                            fi
+
+                            curl -s -X GET \
+                              "${HARNESS_BASE}/ng/api/connectors/${conn_id}?${scope_qp}" \
+                              -H "x-api-key: ${HARNESS_API_KEY}"
+                          }
+
+                          # ---------------------------------------------------------------
+                          # Helper: given a connector's git URL, split out "owner" and,
+                          # if present, "repo" (Account-scoped connectors only give owner;
+                          # Repo-scoped connectors give owner+repo, which takes precedence
+                          # over git_details.repo_name if they ever disagree)
+                          # ---------------------------------------------------------------
+                          parse_owner_repo() {
+                            local url="$1"
+                            local clean="${url%.git}"
+                            clean="${clean#https://}"
+                            clean="${clean#http://}"
+                            clean="${clean#git@}"
+                            clean="${clean/://}"   # turn git@host:owner/repo into host/owner/repo
+                            clean="${clean#*/}"     # drop the host segment, leaving owner[/repo]
+                            echo "$clean"
+                          }
+
                           out_of_sync_count=0
 
                           # ---------------------------------------------------------------
@@ -126,18 +163,46 @@ pipeline:
 
                             current_yaml=$(echo "$pipeline_detail" | jq -r '.pipeline_yaml')
                             file_path=$(echo "$pipeline_detail" | jq -r '.git_details.file_path // empty')
-                            repo_name=$(echo "$pipeline_detail" | jq -r '.git_details.repo_name // empty')
-                            # Org policy: every repo's default branch is always "main",
-                            # so we don't need to read branch_name off git_details here.
+                            repo_name_hint=$(echo "$pipeline_detail" | jq -r '.git_details.repo_name // empty')
+                            connector_ref=$(echo "$pipeline_detail" | jq -r '.git_details.connector_ref // empty')
+                            # Org policy: every repo's default branch is always "main".
                             base_branch="main"
 
-                            if [ -z "$file_path" ] || [ -z "$repo_name" ]; then
-                              echo "  WARN: could not determine file_path/repo_name for $pid, skipping."
+                            if [ -z "$file_path" ] || [ -z "$connector_ref" ]; then
+                              echo "  WARN: could not determine file_path/connector_ref for $pid, skipping."
                               echo "$pid: SKIPPED (incomplete git_details)" >> "$SUMMARY_FILE"
                               continue
                             fi
 
-                            echo "  Repo: ${GIT_OWNER}/${repo_name}  Base branch: ${base_branch}  Path: ${file_path}"
+                            connector_resp=$(fetch_connector "$connector_ref")
+                            connector_url=$(echo "$connector_resp" | jq -r '.data.connector.spec.url // empty')
+                            connector_type=$(echo "$connector_resp" | jq -r '.data.connector.spec.type // empty')
+
+                            if [ -z "$connector_url" ]; then
+                              echo "  WARN: could not resolve connector '${connector_ref}' for $pid (response: $connector_resp), skipping."
+                              echo "$pid: SKIPPED (connector lookup failed)" >> "$SUMMARY_FILE"
+                              continue
+                            fi
+
+                            owner_repo=$(parse_owner_repo "$connector_url")
+                            repo_owner="${owner_repo%%/*}"
+
+                            if [ "$connector_type" == "Repo" ] && [[ "$owner_repo" == */* ]]; then
+                              # Repo-scoped connector: URL already contains the exact repo, trust it
+                              repo_name="${owner_repo#*/}"
+                            else
+                              # Account-scoped connector: URL only gives the owner/org,
+                              # so pair it with the repo name from git_details
+                              repo_name="$repo_name_hint"
+                            fi
+
+                            if [ -z "$repo_owner" ] || [ -z "$repo_name" ]; then
+                              echo "  WARN: could not resolve owner/repo for $pid (connector_url=$connector_url, type=$connector_type), skipping."
+                              echo "$pid: SKIPPED (owner/repo resolution failed)" >> "$SUMMARY_FILE"
+                              continue
+                            fi
+
+                            echo "  Repo: ${repo_owner}/${repo_name}  Base branch: ${base_branch}  Path: ${file_path}"
 
                             refresh_resp=$(curl -s -X POST \
                               "${HARNESS_BASE}/template/api/refresh-template/refreshed-yaml?accountIdentifier=${ACCOUNT_ID}&orgIdentifier=${ORG_ID}&projectIdentifier=${PROJECT_ID}&pipelineIdentifier=${pid}" \
@@ -164,37 +229,37 @@ pipeline:
 
                             # --- Get base branch SHA ---
                             base_ref=$(curl -s -X GET \
-                              "${GITHUB_API}/repos/${GIT_OWNER}/${repo_name}/git/ref/heads/${base_branch}" \
+                              "${GITHUB_API}/repos/${repo_owner}/${repo_name}/git/ref/heads/${base_branch}" \
                               -H "Authorization: token ${GIT_TOKEN}")
                             base_sha=$(echo "$base_ref" | jq -r '.object.sha // empty')
 
                             if [ -z "$base_sha" ]; then
-                              echo "  ERROR: could not resolve base branch SHA for ${GIT_OWNER}/${repo_name}@${base_branch}. Response: $base_ref"
+                              echo "  ERROR: could not resolve base branch SHA for ${repo_owner}/${repo_name}@${base_branch}. Response: $base_ref"
                               echo "$pid: FAILED (could not resolve base branch)" >> "$SUMMARY_FILE"
                               continue
                             fi
 
                             # --- Create new branch off base ---
                             create_branch_resp=$(curl -s -X POST \
-                              "${GITHUB_API}/repos/${GIT_OWNER}/${repo_name}/git/refs" \
+                              "${GITHUB_API}/repos/${repo_owner}/${repo_name}/git/refs" \
                               -H "Authorization: token ${GIT_TOKEN}" \
                               -d "{\"ref\": \"refs/heads/${new_branch}\", \"sha\": \"${base_sha}\"}")
 
                             branch_ok=$(echo "$create_branch_resp" | jq -r '.ref // empty')
                             if [ -z "$branch_ok" ]; then
-                              echo "  ERROR: could not create branch ${new_branch} in ${GIT_OWNER}/${repo_name}. Response: $create_branch_resp"
+                              echo "  ERROR: could not create branch ${new_branch} in ${repo_owner}/${repo_name}. Response: $create_branch_resp"
                               echo "$pid: FAILED (branch creation)" >> "$SUMMARY_FILE"
                               continue
                             fi
 
                             # --- Get current file SHA on the new branch (needed to update it) ---
                             file_meta=$(curl -s -X GET \
-                              "${GITHUB_API}/repos/${GIT_OWNER}/${repo_name}/contents/${file_path}?ref=${new_branch}" \
+                              "${GITHUB_API}/repos/${repo_owner}/${repo_name}/contents/${file_path}?ref=${new_branch}" \
                               -H "Authorization: token ${GIT_TOKEN}")
                             file_sha=$(echo "$file_meta" | jq -r '.sha // empty')
 
                             if [ -z "$file_sha" ]; then
-                              echo "  ERROR: could not find file ${file_path} in ${GIT_OWNER}/${repo_name}@${new_branch}. Response: $file_meta"
+                              echo "  ERROR: could not find file ${file_path} in ${repo_owner}/${repo_name}@${new_branch}. Response: $file_meta"
                               echo "$pid: FAILED (file lookup)" >> "$SUMMARY_FILE"
                               continue
                             fi
@@ -202,13 +267,13 @@ pipeline:
                             encoded_content=$(printf '%s' "$refreshed_yaml" | b64)
 
                             update_resp=$(curl -s -X PUT \
-                              "${GITHUB_API}/repos/${GIT_OWNER}/${repo_name}/contents/${file_path}" \
+                              "${GITHUB_API}/repos/${repo_owner}/${repo_name}/contents/${file_path}" \
                               -H "Authorization: token ${GIT_TOKEN}" \
                               -d "{\"message\": \"Reconcile pipeline ${pid} with latest template version\", \"content\": \"${encoded_content}\", \"sha\": \"${file_sha}\", \"branch\": \"${new_branch}\"}")
 
                             commit_ok=$(echo "$update_resp" | jq -r '.commit.sha // empty')
                             if [ -z "$commit_ok" ]; then
-                              echo "  ERROR: could not commit reconciled YAML to ${GIT_OWNER}/${repo_name}. Response: $update_resp"
+                              echo "  ERROR: could not commit reconciled YAML to ${repo_owner}/${repo_name}. Response: $update_resp"
                               echo "$pid: FAILED (commit)" >> "$SUMMARY_FILE"
                               continue
                             fi
@@ -216,14 +281,14 @@ pipeline:
                             # --- Open the PR ---
                             pr_body="Automated template reconciliation for pipeline \`${pid}\`.\n\nThis PR updates the pipeline YAML to match the latest version of its referenced org/account-level templates. Generated by the Reconcile Pipeline Templates job on $(date -u +%Y-%m-%dT%H:%M:%SZ)."
                             pr_resp=$(curl -s -X POST \
-                              "${GITHUB_API}/repos/${GIT_OWNER}/${repo_name}/pulls" \
+                              "${GITHUB_API}/repos/${repo_owner}/${repo_name}/pulls" \
                               -H "Authorization: token ${GIT_TOKEN}" \
                               -d "{\"title\": \"Reconcile pipeline: ${pid}\", \"head\": \"${new_branch}\", \"base\": \"${base_branch}\", \"body\": \"${pr_body}\"}")
 
                             pr_url=$(echo "$pr_resp" | jq -r '.html_url // empty')
 
                             if [ -z "$pr_url" ]; then
-                              echo "  ERROR: could not open PR in ${GIT_OWNER}/${repo_name}. Response: $pr_resp"
+                              echo "  ERROR: could not open PR in ${repo_owner}/${repo_name}. Response: $pr_resp"
                               echo "$pid: FAILED (PR creation)" >> "$SUMMARY_FILE"
                             else
                               echo "  PR opened: $pr_url"
@@ -267,9 +332,6 @@ pipeline:
                       - name: GIT_TOKEN
                         type: String
                         value: <+secrets.getValue("git_pat_token")>
-                      - name: GIT_OWNER
-                        type: String
-                        value: <+pipeline.variables.git_owner>
                       - name: SLACK_WEBHOOK_URL
                         type: String
                         value: <+pipeline.variables.slack_webhook_url>
