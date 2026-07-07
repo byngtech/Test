@@ -62,6 +62,42 @@ pipeline:
                             }
                           fi
 
+                          # Make sure python3 + PyYAML are available. These are used to do a
+                          # STRUCTURAL diff (parse YAML -> compare data) instead of a raw text
+                          # diff, so that quote-style/whitespace/comment/key-order changes from
+                          # refresh-template don't get treated as real drift.
+                          if ! command -v python3 >/dev/null 2>&1; then
+                            echo "ERROR: python3 is required but not found on this delegate. Add it to a custom delegate image." >&2
+                            exit 1
+                          fi
+                          if ! python3 -c "import yaml" >/dev/null 2>&1; then
+                            echo "PyYAML not found, attempting install..."
+                            (pip3 install --break-system-packages -q pyyaml \
+                              || pip install --break-system-packages -q pyyaml \
+                              || (apt-get update -qq && apt-get install -y -qq python3-yaml)) || {
+                              echo "ERROR: PyYAML is required but could not be installed on this delegate. Add it to a custom delegate image." >&2
+                              exit 1
+                            }
+                          fi
+
+                          # ---------------------------------------------------------------
+                          # Helper: canonicalize a YAML string into sorted-key JSON so that
+                          # two YAML documents that are semantically identical (regardless of
+                          # quote style, key order, indentation, or comments) produce the
+                          # exact same output string.
+                          # ---------------------------------------------------------------
+                          normalize_yaml() {
+                            python3 -c '
+                          import sys, yaml, json
+                          try:
+                              data = yaml.safe_load(sys.stdin.read())
+                          except yaml.YAMLError as e:
+                              print(f"__YAML_PARSE_ERROR__:{e}", file=sys.stderr)
+                              sys.exit(1)
+                          print(json.dumps(data, sort_keys=True, default=str))
+                          '
+                          }
+
                           # ---------------------------------------------------------------
                           # 1. List pipelines in the project (paginated), keep Git-backed ones
                           # ---------------------------------------------------------------
@@ -217,8 +253,27 @@ pipeline:
                             fi
 
                             if [ "$current_yaml" == "$refreshed_yaml" ]; then
-                              echo "  Pipeline $pid is in sync with its templates."
+                              echo "  Pipeline $pid is byte-for-byte identical. In sync."
                               echo "$pid: in sync" >> "$SUMMARY_FILE"
+                              continue
+                            fi
+
+                            # Text differs -- but that might just be quote style, key order,
+                            # or comments changing. Do a STRUCTURAL comparison instead.
+                            current_norm=$(printf '%s' "$current_yaml" | normalize_yaml) || {
+                              echo "  WARN: could not parse current YAML for $pid as valid YAML, skipping."
+                              echo "$pid: SKIPPED (current YAML failed to parse)" >> "$SUMMARY_FILE"
+                              continue
+                            }
+                            refreshed_norm=$(printf '%s' "$refreshed_yaml" | normalize_yaml) || {
+                              echo "  WARN: could not parse refreshed YAML for $pid as valid YAML, skipping."
+                              echo "$pid: SKIPPED (refreshed YAML failed to parse)" >> "$SUMMARY_FILE"
+                              continue
+                            }
+
+                            if [ "$current_norm" == "$refreshed_norm" ]; then
+                              echo "  Pipeline $pid text differs (quotes/whitespace/comments/key order) but content is IDENTICAL. Ignoring."
+                              echo "$pid: in sync (cosmetic-only diff ignored)" >> "$SUMMARY_FILE"
                               continue
                             fi
 
