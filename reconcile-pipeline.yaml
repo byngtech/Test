@@ -62,40 +62,58 @@ pipeline:
                             }
                           fi
 
-                          # Make sure python3 + PyYAML are available. These are used to do a
-                          # STRUCTURAL diff (parse YAML -> compare data) instead of a raw text
-                          # diff, so that quote-style/whitespace/comment/key-order changes from
-                          # refresh-template don't get treated as real drift.
-                          if ! command -v python3 >/dev/null 2>&1; then
-                            echo "ERROR: python3 is required but not found on this delegate. Add it to a custom delegate image." >&2
+                          # Make sure the GO-BASED mikefarah/yq is available (NOT the Python 'yq' from
+                          # apt/pip, which is a different tool with an incompatible CLI entirely).
+                          # mikefarah/yq ALSO has two incompatible generations of its own:
+                          #   v3.x -> subcommand style:  yq r -j -        (read, --tojson, stdin)
+                          #   v4.x -> eval style:        yq -o=json eval '.' -
+                          # We detect which one is actually installed and dispatch accordingly, so this
+                          # keeps working whether the image has v3 (as of this run) or gets bumped to v4
+                          # later. Recommendation either way: bake yq into this step's image rather than
+                          # relying on a runtime download -- GitHub release downloads can hit rate limits
+                          # or be blocked entirely by delegate network policy.
+                          if ! command -v yq >/dev/null 2>&1; then
+                            echo "ERROR: yq not found. Install mikefarah/yq (https://github.com/mikefarah/yq) into this step's container image." >&2
                             exit 1
                           fi
-                          if ! python3 -c "import yaml" >/dev/null 2>&1; then
-                            echo "PyYAML not found, attempting install..."
-                            (pip3 install --break-system-packages -q pyyaml \
-                              || pip install --break-system-packages -q pyyaml \
-                              || (apt-get update -qq && apt-get install -y -qq python3-yaml)) || {
-                              echo "ERROR: PyYAML is required but could not be installed on this delegate. Add it to a custom delegate image." >&2
-                              exit 1
-                            }
+
+                          YQ_MAJOR=""
+                          if printf 'a: 1\n' | yq r -j - >/dev/null 2>&1; then
+                            YQ_MAJOR="3"
+                          elif printf 'a: 1\n' | yq -o=json eval '.' - >/dev/null 2>&1; then
+                            YQ_MAJOR="4"
                           fi
+
+                          if [ -z "$YQ_MAJOR" ]; then
+                            echo "ERROR: 'yq' was found but neither v3 ('yq r -j -') nor v4 ('yq -o=json eval') syntax works. This is likely the Python-based yq (from apt/pip), not mikefarah/yq. Replace it with the Go binary from https://github.com/mikefarah/yq/releases in this step's image." >&2
+                            exit 1
+                          fi
+                          echo "Detected mikefarah/yq v${YQ_MAJOR} syntax."
 
                           # ---------------------------------------------------------------
                           # Helper: canonicalize a YAML string into sorted-key JSON so that
                           # two YAML documents that are semantically identical (regardless of
                           # quote style, key order, indentation, or comments) produce the
-                          # exact same output string.
+                          # exact same output string. Uses yq to convert YAML -> JSON, then
+                          # jq -cS to produce compact, sorted-key canonical JSON.
                           # ---------------------------------------------------------------
                           normalize_yaml() {
-                            python3 -c '
-                          import sys, yaml, json
-                          try:
-                              data = yaml.safe_load(sys.stdin.read())
-                          except yaml.YAMLError as e:
-                              print(f"__YAML_PARSE_ERROR__:{e}", file=sys.stderr)
-                              sys.exit(1)
-                          print(json.dumps(data, sort_keys=True, default=str))
-                          '
+                            local input json err
+                            input="$(cat)"
+                            if [ "$YQ_MAJOR" = "3" ]; then
+                              if ! json="$(printf '%s' "$input" | yq r -j - 2>/dev/null)"; then
+                                err="$(printf '%s' "$input" | yq r -j - 2>&1 1>/dev/null)"
+                                echo "__YAML_PARSE_ERROR__:$err" >&2
+                                return 1
+                              fi
+                            else
+                              if ! json="$(printf '%s' "$input" | yq -o=json eval '.' - 2>/dev/null)"; then
+                                err="$(printf '%s' "$input" | yq -o=json eval '.' - 2>&1 1>/dev/null)"
+                                echo "__YAML_PARSE_ERROR__:$err" >&2
+                                return 1
+                              fi
+                            fi
+                            printf '%s' "$json" | jq -cS '.'
                           }
 
                           # ---------------------------------------------------------------
